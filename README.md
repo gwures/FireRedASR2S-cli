@@ -45,22 +45,6 @@ choco install ffmpeg
 # 或下载预编译二进制文件并添加到PATH
 ```
 
-**Linux (Ubuntu/Debian):**
-```bash
-sudo apt update
-sudo apt install ffmpeg
-```
-
-**Linux (CentOS/RHEL):**
-```bash
-sudo yum install ffmpeg
-```
-
-**Mac:**
-```bash
-brew install ffmpeg
-```
-
 ### 4. 下载预训练模型
 
 项目需要下载VAD和ASR预训练模型。运行下载脚本：
@@ -120,6 +104,7 @@ python cli.py -h
 ## 核心问题
 
 相比于原开源项目，最大的改进就是：
+
 - Beam Search 解码器实现了增量解码 + KV Cache
 - 工业级别的分批策略：降序排序 + 动态分桶+最佳适应贪心 + 短片段填充
 - 若干算法复杂度问题的优化。
