@@ -57,6 +57,14 @@ python download_models.py
 - `pretrained_models/FireRedVAD/VAD` - VAD模型
 - `pretrained_models/FireRedASR2-AED` - ASR模型
 
+### 5. 开启TF32（可选但推荐）
+
+针对系统而不是本项目：
+
+```bash
+python check_tf32.py
+```
+
 ## 使用说明
 
 ### 基本用法
