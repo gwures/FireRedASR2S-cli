@@ -1,15 +1,10 @@
-# FireRedASR2S 语音识别系统
+# FireRedASR2S-cli 语音识别系统
 
-FireRedASR2S 是一款基于深度学习的端到端语音识别系统，集成了VAD（语音活动检测）和ASR（自动语音识别）功能，支持批量处理音频文件并输出带时间戳的字幕文件。
+FireRedASR2S-cli 是一款基于开源项目 [FireRedASR2S](https://github.com/FireRedTeam/FireRedASR2S) 开发的端到端语音识别系统，支持批量处理音频/视频文件并输出带时间戳的字幕文件或者纯文本。
 
-## 功能特性
+截止至2026年3月初，据 [FireRedASR2S](https://github.com/FireRedTeam/FireRedASR2S) 官方报告称 FireRedASR2S 已经取得了开源 ASR 模型的 SOTA 。
 
-- **VAD语音活动检测**：精确检测音频中的语音片段
-- **AED端到端识别**：基于Attention Encoder Decoder架构的高精度语音识别
-- **批处理优化**：支持批量处理多个音频文件，优化内存使用
-- **多种格式支持**：支持WAV、MP3、FLAC、AAC、OGG、M4A等音频格式，以及MP4、AVI、MKV等视频格式
-- **时间戳输出**：支持词级和句子级时间戳输出
-- **标点恢复**：可选的智能标点恢复功能
+本项目移除了就转写需求而言的不需要的 LID模型、体验不佳的 punc 模型，并实现了更深层次的算法优化，欢迎跑官方原版做对比测试。（triton_tensorrt 版犯规喔。）
 
 ## 环境要求
 
@@ -83,7 +78,9 @@ python cli.py -h
 
 - --ts, --timestamp     返回词级时间戳  ：时间戳更精确，但是主观感受不出来，拖慢5%左右效率。
 
-- --dur SECONDS      根据GPU实力调整，建议为32的倍数。当前单片段时长为0.32s-16s，每秒为100帧。（以6G的RTX3060为例，开启游戏模式，RTF在0.03左右）
+- --dur SECONDS      单个批次总时长上限。根据GPU实力调整，建议为32的倍数。当前单片段时长为0.32s-16s，每秒为100帧。（config.py:"min_speech_frame": 32, "max_speech_frame": 1600，最大为2000）
+
+（以6G的RTX3060为例，开启游戏模式，RTF在0.03左右）
 
 - --mvbs                  实验特性，即VAD模型是否同时处理多个音频。除非你音频时长相差不大，否则不建议改为并行（大于1的整数）。
 
@@ -106,6 +103,8 @@ python cli.py -h
 
 ### 分批策略
 
+原理：ASR 模型做批量推理时，为了满足 GPU 张量的维度一致性要求，同一个 batch 内的所有音频片段必须 Padding 到该 batch 中「最长片段的长度」（按帧数 / 采样点数计算，对应时长即 batch 内最长片段的时长）。比如 batch 内有 16s、8s、0.32s 的片段，8s 和 0.32s 的片段会被补零（zero-padding）到 16s 的长度，再和 16s 片段组成统一维度的张量送入模型。贪心算法是为了最大限度降低无效计算的比重。
+
 `split_vad_to_batches()` 函数使用动态聚类分桶策略：
 1. **按音频分组**：将VAD片段按`audio_idx`分组，保留数据局部性
 2. **动态分桶**：时长相近的片段放入同桶（同桶比≤3，最大桶数4）
@@ -117,7 +116,7 @@ python cli.py -h
 
 相比于原开源项目，最大的改进就是：
 
-- Beam Search 解码器实现了增量解码 + KV Cache
+- Beam Search 解码器实现了增量解码 + KV Cache。
 - 工业级别的分批策略：降序排序 + 动态分桶+最佳适应贪心 + 短片段填充
 - 若干算法复杂度问题的优化。
 
