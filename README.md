@@ -26,14 +26,18 @@ git clone <repository-url>
 cd fireredasr
 ```
 
-### 2. 安装依赖
+### 2. 安装依赖（建议在uv等虚拟环境中操作）
 
 ```bash
 pip install -r requirements.txt
 ```
-⚠️：pytorch并没有写进依赖中，请安装自己需要的版本。
+⚠️：pytorch并没有写进依赖中，请安装自己需要的版本。（只需要 torch、torchaudio，不需要torchvision。cuda118及以上即可）
 
 https://pytorch.org/get-started/locally/
+
+例子：安装适合 cuda126 的最新版 pytorch
+
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu126
 
 ### 3. 安装ffmpeg
 
@@ -71,7 +75,7 @@ python check_tf32.py
 ```bash
 python cli.py -h
 ```
-上面有示例。操作对象是目标文件地址或者目录，支持混合输入，会自动识别。默认配置已实现最优。
+然后学习输出的示例。操作对象是目标文件地址或者目录，支持混合输入，会自动识别。默认配置已实现最优。
 
 
 简单解释
@@ -81,7 +85,7 @@ python cli.py -h
 
 - --dur SECONDS      根据GPU实力调整，建议为32的倍数。当前单片段时长为0.32s-16s，每秒为100帧。（以6G的RTX3060为例，开启游戏模式，RTF在0.03左右）
 
-- --mvbs                  实验特性，除非你同时处理的任务时长相差不大，否则不建议改为并行（大于1的整数）。
+- --mvbs                  实验特性，即VAD模型是否同时处理多个音频。除非你音频时长相差不大，否则不建议改为并行（大于1的整数）。
 
 
 ### 标点配置 (config.py - PUNCTUATION_CONFIG)
@@ -97,7 +101,7 @@ python cli.py -h
 | `prompt` | - | 标点恢复提示词 |
 | `max_timeout` | 600 | API超时时间(秒) |
 
-（请自行去config.py填入相关参数，参数配置错误不会影响任务转写，因为标点是在任务结束后的额外操作）
+（请自行去config.py填入相关参数，参数配置错误不会影响任务转写，因为标点是任务结束后的额外操作。）
 
 
 ### 分批策略
@@ -109,7 +113,7 @@ python cli.py -h
 4. **短片段填充**：≤1s的短片段会被填充到有剩余空间的batch中
 
 
-## 核心问题
+## 核心特色
 
 相比于原开源项目，最大的改进就是：
 
