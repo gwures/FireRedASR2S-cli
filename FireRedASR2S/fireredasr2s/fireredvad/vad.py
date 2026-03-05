@@ -75,7 +75,7 @@ class FireRedVad:
                 probs, _ = self.vad_model.forward(feats.unsqueeze(0))
                 probs = probs.cpu().squeeze()
             else:
-                logger.warning(f"Too long input, split every {self.config.chunk_max_frame} frames")
+                logger.debug(f"Too long input, split every {self.config.chunk_max_frame} frames")
                 chunk_probs = []
                 chunks = feats.split(self.config.chunk_max_frame, dim=0)
                 for chunk in chunks:
@@ -95,68 +95,3 @@ class FireRedVad:
         if isinstance(audio, str):
             result["wav_path"] = audio
         return result, probs
-
-    def detect_batch(self, audios, do_postprocess=True):
-        """
-        批量 VAD 推理
-        
-        Args:
-            audios: 音频列表，每个元素格式为 (sample_rate, wav_np) 或文件路径
-            do_postprocess: 是否进行后处理
-            
-        Returns:
-            results: 结果列表，每个元素为 {"dur": float, "timestamps": List}
-            probs_list: 概率列表
-        """
-        feats_list = []
-        durs = []
-        
-        for audio in audios:
-            feats, dur = self.audio_feat.extract(audio)
-            feats_list.append(feats)
-            durs.append(dur)
-        
-        if len(feats_list) == 0:
-            return [], []
-        
-        max_len = max(f.size(0) for f in feats_list)
-        batch_size = len(feats_list)
-        
-        padded_feats = torch.zeros(batch_size, max_len, feats_list[0].size(1))
-        feat_lengths = torch.zeros(batch_size, dtype=torch.long)
-        
-        for i, feats in enumerate(feats_list):
-            feat_len = feats.size(0)
-            padded_feats[i, :feat_len, :] = feats
-            feat_lengths[i] = feat_len
-        
-        if self.config.use_gpu:
-            padded_feats = padded_feats.pin_memory()
-            padded_feats = padded_feats.cuda(non_blocking=True)
-            feat_lengths = feat_lengths.cuda()
-        
-        with torch.inference_mode():
-            probs, _ = self.vad_model.forward(padded_feats, input_lengths=feat_lengths)
-            probs = probs.cpu()
-        
-        results = []
-        probs_list = []
-        
-        for i, (dur, feat_len) in enumerate(zip(durs, feat_lengths)):
-            prob = probs[i, :feat_len].squeeze()
-            
-            if not do_postprocess:
-                results.append(None)
-                probs_list.append(prob)
-                continue
-            
-            decisions = self.vad_postprocessor.process(prob.tolist())
-            starts_ends_s = self.vad_postprocessor.decision_to_segment(decisions, dur)
-            
-            result = {"dur": round(dur, 3), "timestamps": starts_ends_s}
-            if isinstance(audios[i], str):
-                result["wav_path"] = audios[i]
-            results.append(result)
-            probs_list.append(prob)
-        
-        return results, probs_list

@@ -46,7 +46,6 @@ class FireRedAsr2System:
 
         # 2. VAD output to ASR input
         asr_results = []
-        assert sample_rate == 16000
         batch_asr_uttid = []
         batch_asr_wav = []
         for j, (start_s, end_s) in enumerate(vad_segments):

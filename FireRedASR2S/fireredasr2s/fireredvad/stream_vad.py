@@ -118,7 +118,7 @@ class FireRedStreamVad:
             if feats.size(0) <= self.config.chunk_max_frame:
                 probs, _ = self.vad_model.forward(feats.unsqueeze(0))
             else:
-                logger.warning(f"Too long input, split every {self.config.chunk_max_frame} frames")
+                logger.debug(f"Too long input, split every {self.config.chunk_max_frame} frames")
                 chunk_probs = []
                 chunks = feats.split(self.config.chunk_max_frame, dim=0)
                 for chunk in chunks:

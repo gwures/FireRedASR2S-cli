@@ -1,4 +1,3 @@
-
 from pathlib import Path
 
 BASE_DIR = Path(__file__).parent.resolve()
@@ -16,7 +15,7 @@ MODEL_PATHS = {
 
 ASR_CONFIG = {
     "use_gpu": True,
-    "use_half": False,
+    "use_half": True,
     "beam_size": 3,
     "nbest": 1,
     "decode_max_len": 0,
@@ -30,7 +29,7 @@ VAD_CONFIG = {
     "use_gpu": True,
     "smooth_window_size": 5,
     "speech_threshold": 0.4,
-    "min_speech_frame": 32,
+    "min_speech_frame": 50,
     "max_speech_frame": 1600,
     "min_silence_frame": 20,
     "merge_silence_frame": 0,
@@ -41,7 +40,7 @@ VAD_CONFIG = {
 PUNCTUATION_CONFIG = {
     "enabled": True,
     "endpoint": "https://api.siliconflow.cn/v1/chat/completions",
-    "api_key": "",
+    "api_key": "sk-l4esdghjjjj",
     "model": "THUDM/GLM-4-9B-0414",
     "prompt": "为下方无标点的长文本进行标准化标点补全。绝不改动原文任何字词、语序，仅补充标点；不要其他解释：\n{text}",
     "max_timeout": 600,

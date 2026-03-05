@@ -27,7 +27,6 @@ class AudioFeat:
         else:
             wav_np = audio
             sample_rate = 16000
-        assert sample_rate == 16000
 
         dur = wav_np.shape[0] / sample_rate
         fbank = self.fbank((sample_rate, wav_np))

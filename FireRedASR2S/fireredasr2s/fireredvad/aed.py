@@ -77,7 +77,7 @@ class FireRedAed:
             assert probs.size(-1) == len(self.IDX2EVENT)
             probs = probs.cpu().squeeze(0)  # (T,3)
         else:
-            logger.warning(f"Too long input, split every {self.config.chunk_max_frame} frames")
+            logger.debug(f"Too long input, split every {self.config.chunk_max_frame} frames")
             chunk_probs = []
             chunks = feat.split(self.config.chunk_max_frame, dim=0)
             for chunk in chunks:
