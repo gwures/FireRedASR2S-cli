@@ -10,26 +10,13 @@ import numpy as np
 import soundfile as sf
 
 SAMPLE_RATE = 16000
-FRAME_LENGTH_SAMPLE = 400
-FRAME_SHIFT_SAMPLE = 160
 
 _BLANK_SIL_PATTERN = re.compile(r"(<blank>)|(<sil>)")
 
 
-def calc_original_seq_len(original_audio_samples: int) -> int:
-    if original_audio_samples < FRAME_LENGTH_SAMPLE:
-        return 1
-    return (original_audio_samples - FRAME_LENGTH_SAMPLE) // FRAME_SHIFT_SAMPLE + 1
-
-
-def filter_timestamp_by_original_len(
-    timestamp: List, original_seq_len: int, original_audio_dur: float
-) -> List:
+def filter_timestamp_by_duration(timestamp: List, audio_dur: float) -> List:
     if not timestamp:
         return timestamp
-
-    def frame2time(frame_idx: int) -> float:
-        return (frame_idx * FRAME_SHIFT_SAMPLE) / SAMPLE_RATE
 
     filtered_timestamp = []
     for item in timestamp:
@@ -37,14 +24,13 @@ def filter_timestamp_by_original_len(
             filtered_timestamp.append(item)
             continue
         w, s, e = item
+        s_time = float(s)
+        e_time = float(e)
 
-        s_time = frame2time(s) if isinstance(s, int) else float(s)
-        e_time = frame2time(e) if isinstance(e, int) else float(e)
-
-        if e_time <= original_audio_dur:
+        if e_time <= audio_dur:
             filtered_timestamp.append((w, s_time, e_time))
-        elif s_time < original_audio_dur:
-            filtered_timestamp.append((w, s_time, original_audio_dur))
+        elif s_time < audio_dur:
+            filtered_timestamp.append((w, s_time, audio_dur))
 
     return filtered_timestamp
 
@@ -79,14 +65,20 @@ class MixedASRSystem:
         self.max_batch_dur_s = config.get("max_batch_dur_s", 64)
         self.use_bfd = config.get("use_bfd", False)
 
+        asr_config = config.get("asr", {})
+        use_fp16 = asr_config.get("use_half", True)
+        return_timestamp = asr_config.get("return_timestamp", True)
+
         logger.info(
-            f"MixedASRSystem created (max_batch_dur_s={self.max_batch_dur_s}, use_bfd={self.use_bfd})"
+            f"MixedASRSystem created (max_batch_dur_s={self.max_batch_dur_s}, "
+            f"use_bfd={self.use_bfd}, fp16={use_fp16}, timestamp={return_timestamp})"
         )
 
         self._load_vad()
         self._load_asr()
+        self._load_punc()
 
-        logger.info("VAD and ASR preloaded!")
+        logger.info("VAD, ASR and Punc preloaded!")
 
     def _load_vad(self):
         logger.info("Loading VAD model...")
@@ -106,6 +98,24 @@ class MixedASRSystem:
         )
         logger.info("ASR model loaded!")
 
+    def _load_punc(self):
+        punc_config = self.config.get("punc")
+        if not punc_config:
+            self.punc = None
+            return
+
+        punc_model_path = self.model_paths.get("punc")
+        if not punc_model_path:
+            self.punc = None
+            return
+
+        logger.info("Loading Punc model...")
+        from fireredasr2s.fireredpunc import FireRedPunc, FireRedPuncConfig
+
+        config = FireRedPuncConfig(**punc_config)
+        self.punc = FireRedPunc.from_pretrained(punc_model_path, config)
+        logger.info("Punc model loaded!")
+
     @staticmethod
     def _load_audio(audio_path: str) -> np.ndarray:
         audio_data, _ = sf.read(audio_path, dtype="int16")
@@ -118,14 +128,17 @@ class MixedASRSystem:
         max_bucket_num=5,
         max_ratio=2,
         short_seg_thresh=1.0,
+        heap_switch_thresh=500,
     ):
         """
         BFD (Best-Fit Decreasing) 算法：动态聚类分桶 + 降序排序 + 最佳适应贪心 + 短片段填充
+        小N使用线性遍历BFD，大N使用堆调度BFD (O(N log M))
         :param segments: VAD片段列表（单个音频）
         :param max_batch_dur_s: ASR单batch最大总时长
         :param max_bucket_num: 最大桶数（避免过细分桶）
         :param max_ratio: 同桶最长/最短时长比
         :param short_seg_thresh: 短片段阈值（秒），≤该值的片段会做填充优化
+        :param heap_switch_thresh: 启用堆优化的片段数阈值，N>该值时使用堆调度
         :return: 分批后的片段索引列表
         """
         if not segments:
@@ -157,27 +170,72 @@ class MixedASRSystem:
                 else:
                     buckets[-1].append(seg)
 
+        total_seg_num = len(seg_info)
+        use_heap = total_seg_num > heap_switch_thresh
+
         all_batches = []
         for bucket in buckets:
             if not bucket:
                 continue
-            batches = []
-            for seg in bucket:
-                idx, s, e, dur = seg
-                min_remain = float("inf")
-                target_idx = -1
-                for b_idx, (used_dur, seg_idxs) in enumerate(batches):
-                    remain = max_batch_dur_s - used_dur
-                    if remain >= dur and remain < min_remain:
-                        min_remain = remain
-                        target_idx = b_idx
-                if target_idx != -1:
-                    batches[target_idx] = (
-                        batches[target_idx][0] + dur,
-                        batches[target_idx][1] + [idx],
-                    )
-                else:
-                    batches.append((dur, [idx]))
+
+            if use_heap:
+                batch_state: Dict[int, Tuple[float, float, List[int]]] = {}
+                min_heap: List[Tuple[float, int]] = []
+                batch_counter = 0
+
+                for seg in bucket:
+                    idx, s, e, dur = seg
+                    target_batch_id = -1
+                    valid_entries = []
+
+                    while min_heap:
+                        current_R, b_id = heapq.heappop(min_heap)
+                        actual_valid_dur, _, _ = batch_state[b_id]
+                        actual_R = max_batch_dur_s - actual_valid_dur
+                        if abs(current_R - actual_R) > 1e-6:
+                            continue
+                        valid_entries.append((current_R, b_id))
+                        if current_R >= dur:
+                            target_batch_id = b_id
+                            break
+
+                    for entry in valid_entries:
+                        heapq.heappush(min_heap, entry)
+
+                    if target_batch_id != -1:
+                        valid_dur, max_len, seg_idxs = batch_state[target_batch_id]
+                        new_valid_dur = valid_dur + dur
+                        new_max_len = max(max_len, dur)
+                        new_seg_idxs = seg_idxs + [idx]
+                        batch_state[target_batch_id] = (new_valid_dur, new_max_len, new_seg_idxs)
+                        new_R = max_batch_dur_s - new_valid_dur
+                        heapq.heappush(min_heap, (new_R, target_batch_id))
+                    else:
+                        new_batch_id = batch_counter
+                        batch_counter += 1
+                        batch_state[new_batch_id] = (dur, dur, [idx])
+                        new_R = max_batch_dur_s - dur
+                        heapq.heappush(min_heap, (new_R, new_batch_id))
+
+                batches = [(state[0], state[2]) for state in batch_state.values()]
+            else:
+                batches = []
+                for seg in bucket:
+                    idx, s, e, dur = seg
+                    min_remain = float("inf")
+                    target_idx = -1
+                    for b_idx, (used_dur, seg_idxs) in enumerate(batches):
+                        remain = max_batch_dur_s - used_dur
+                        if remain >= dur and remain < min_remain:
+                            min_remain = remain
+                            target_idx = b_idx
+                    if target_idx != -1:
+                        batches[target_idx] = (
+                            batches[target_idx][0] + dur,
+                            batches[target_idx][1] + [idx],
+                        )
+                    else:
+                        batches.append((dur, [idx]))
 
             if short_seg_thresh > 0:
                 short_segs = []
@@ -330,27 +388,24 @@ class MixedASRSystem:
         self,
         uttids: List[str],
         wavs: List[Tuple],
-        seq_lens: List[int],
         audio_durs: List[float],
         current_max_dur: float = None,
         min_dur_s: float = 8.0,
-    ) -> Tuple[Dict, Dict, Dict, int]:
+    ) -> Tuple[Dict, Dict, int]:
         """
         支持自适应降级的 batch 处理函数（按时长降级）
 
         Args:
             uttids: utterance ID 列表
             wavs: 音频数据列表，格式 [(sample_rate, wav_np), ...]
-            seq_lens: 原始序列长度列表
             audio_durs: 原始音频时长列表
             current_max_dur: 当前子batch最大时长限制（OOM降级时使用）
             min_dur_s: 最小时长阈值，低于此值将逐个处理
 
         Returns:
-            (uttid2result, uttid2seq_len, uttid2audio_dur, failed_count)
+            (uttid2result, uttid2audio_dur, failed_count)
         """
         uttid2result = {}
-        uttid2seq_len = {}
         uttid2audio_dur = {}
         failed_count = 0
 
@@ -360,14 +415,13 @@ class MixedASRSystem:
                 a for a in batch_asr_results if not _BLANK_SIL_PATTERN.search(a["text"])
             ]
 
-            for res, seq_len, audio_dur in zip(batch_asr_results, seq_lens, audio_durs):
+            for res, audio_dur in zip(batch_asr_results, audio_durs):
                 uttid = res["uttid"]
                 if "timestamp" in res:
-                    res["timestamp"] = filter_timestamp_by_original_len(
-                        res["timestamp"], seq_len, audio_dur
+                    res["timestamp"] = filter_timestamp_by_duration(
+                        res["timestamp"], audio_dur
                     )
                 uttid2result[uttid] = res
-                uttid2seq_len[uttid] = seq_len
                 uttid2audio_dur[uttid] = audio_dur
 
         except RuntimeError as e:
@@ -404,18 +458,17 @@ class MixedASRSystem:
                             if single_result:
                                 res = single_result[0]
                                 if "timestamp" in res:
-                                    res["timestamp"] = filter_timestamp_by_original_len(
-                                        res["timestamp"], seq_lens[i], audio_durs[i]
+                                    res["timestamp"] = filter_timestamp_by_duration(
+                                        res["timestamp"], audio_durs[i]
                                     )
                                 uttid2result[uttids[i]] = res
-                                uttid2seq_len[uttids[i]] = seq_lens[i]
                                 uttid2audio_dur[uttids[i]] = audio_durs[i]
                         except Exception as inner_e:
                             logger.error(
                                 f"Failed to process single segment {uttids[i]}: {inner_e}"
                             )
                             failed_count += 1
-                    return uttid2result, uttid2seq_len, uttid2audio_dur, failed_count
+                    return uttid2result, uttid2audio_dur, failed_count
 
                 target_dur = current_max_dur or (total_dur // 2)
                 target_dur = max(target_dur, min_dur_s)
@@ -428,14 +481,12 @@ class MixedASRSystem:
                 for sub_indices in sub_batch_indices:
                     sub_uttids = [uttids[i] for i in sub_indices]
                     sub_wavs = [wavs[i] for i in sub_indices]
-                    sub_seq_lens = [seq_lens[i] for i in sub_indices]
                     sub_audio_durs = [audio_durs[i] for i in sub_indices]
 
-                    sub_result, sub_seq, sub_dur, sub_failed = (
+                    sub_result, sub_dur, sub_failed = (
                         self._process_batch_with_adaptive_fallback(
                             sub_uttids,
                             sub_wavs,
-                            sub_seq_lens,
                             sub_audio_durs,
                             current_max_dur=target_dur,
                             min_dur_s=min_dur_s,
@@ -443,7 +494,6 @@ class MixedASRSystem:
                     )
 
                     uttid2result.update(sub_result)
-                    uttid2seq_len.update(sub_seq)
                     uttid2audio_dur.update(sub_dur)
                     failed_count += sub_failed
             else:
@@ -453,7 +503,7 @@ class MixedASRSystem:
             logger.error(f"Unexpected error during ASR: {str(e)}", exc_info=True)
             failed_count = len(uttids)
 
-        return uttid2result, uttid2seq_len, uttid2audio_dur, failed_count
+        return uttid2result, uttid2audio_dur, failed_count
 
     def _process_single_audio(
         self, audio_idx: int, audio_info: Dict, max_batch_dur_s: float
@@ -530,7 +580,6 @@ class MixedASRSystem:
 
                     batch_uttids = []
                     batch_wavs = []
-                    batch_seq_lens = []
                     batch_audio_durs = []
 
                     for seg in batch_segs:
@@ -539,21 +588,18 @@ class MixedASRSystem:
                         wav_segment = audio_data[start_sample:end_sample]
 
                         original_audio_dur = seg.end_s - seg.start_s
-                        original_audio_samples = len(wav_segment)
-                        original_seq_len = calc_original_seq_len(original_audio_samples)
 
                         batch_uttids.append(seg.uttid)
                         batch_wavs.append((SAMPLE_RATE, wav_segment))
-                        batch_seq_lens.append(original_seq_len)
                         batch_audio_durs.append(original_audio_dur)
 
                     logger.debug(
                         f"[{audio_idx}] ASR batch {batch_idx+1}/{len(batches)}: {len(batch_wavs)} segments"
                     )
 
-                    result, seq_len, audio_dur, failed = (
+                    result, audio_dur, failed = (
                         self._process_batch_with_adaptive_fallback(
-                            batch_uttids, batch_wavs, batch_seq_lens, batch_audio_durs
+                            batch_uttids, batch_wavs, batch_audio_durs
                         )
                     )
 
@@ -610,6 +656,80 @@ class MixedASRSystem:
                         )
 
             full_text = "".join(text_parts)
+
+            if self.punc and sentences:
+                logger.info(f"[{audio_idx}] 开始添加标点...")
+                try:
+                    if words:
+                        batch_timestamp = []
+                        for seg in audio_segments:
+                            if seg.uttid not in uttid2asr_result:
+                                continue
+                            asr_res = uttid2asr_result[seg.uttid]
+                            if "timestamp" in asr_res and asr_res["timestamp"]:
+                                seg_start_ms = round(seg.start_s * 1000)
+                                timestamp_list = []
+                                for w, s, e in asr_res["timestamp"]:
+                                    timestamp_list.append((w, s, e))
+                                batch_timestamp.append(timestamp_list)
+                        
+                        if batch_timestamp:
+                            punc_results = self.punc.process_with_timestamp(batch_timestamp)
+                            
+                            new_sentences = []
+                            punc_idx = 0
+                            for seg in audio_segments:
+                                if seg.uttid not in uttid2asr_result:
+                                    continue
+                                asr_res = uttid2asr_result[seg.uttid]
+                                if "timestamp" not in asr_res or not asr_res["timestamp"]:
+                                    continue
+                                
+                                seg_start_ms = round(seg.start_s * 1000)
+                                seg_end_ms = round(seg.end_s * 1000)
+                                
+                                if punc_idx < len(punc_results):
+                                    punc_result = punc_results[punc_idx]
+                                    punc_sentences = punc_result.get("punc_sentences", [])
+                                    
+                                    for i, punc_sent in enumerate(punc_sentences):
+                                        punc_text = punc_sent["punc_text"]
+                                        punc_start_s = punc_sent["start_s"]
+                                        punc_end_s = punc_sent["end_s"]
+                                        
+                                        new_start_ms = round(punc_start_s * 1000 + seg_start_ms)
+                                        new_end_ms = round(punc_end_s * 1000 + seg_start_ms)
+                                        
+                                        if i == 0:
+                                            new_start_ms = seg_start_ms
+                                        if i == len(punc_sentences) - 1:
+                                            new_end_ms = seg_end_ms
+                                        
+                                        new_sentences.append({
+                                            "start_ms": new_start_ms,
+                                            "end_ms": new_end_ms,
+                                            "text": punc_text,
+                                            "asr_confidence": asr_res.get("confidence", 0.0),
+                                        })
+                                    punc_idx += 1
+                            
+                            if new_sentences:
+                                sentences = new_sentences
+                                full_text = "".join(s["text"] for s in sentences)
+                    else:
+                        batch_text = [s["text"] for s in sentences]
+                        punc_results = self.punc.process(batch_text)
+                        
+                        for i, punc_res in enumerate(punc_results):
+                            sentences[i]["text"] = punc_res["punc_text"]
+                        
+                        full_text = "".join(s["text"] for s in sentences)
+                    
+                    logger.info(f"[{audio_idx}] 标点添加完成")
+                except Exception as e:
+                    logger.warning(f"[{audio_idx}] 标点添加失败: {str(e)}，使用原始文本")
+
+            full_text = re.sub(r'([.,!?])\s*([a-zA-Z])', r'\1 \2', full_text)
 
             result = {
                 "uttid": os.path.basename(audio_path).split(".")[0],
@@ -697,12 +817,6 @@ class MixedASRSystem:
         overall_rtf = (
             total_processing_time / total_audio_dur if total_audio_dur > 0 else 0.0
         )
-
-        logger.info(f"批量处理完成 - 成功: {success_count}, 失败: {error_count}")
-        logger.info(
-            f"总音频时长: {total_audio_dur:.2f}s, 总处理用时: {total_processing_time:.2f}s"
-        )
-        logger.info(f"平均 RTF: {avg_rtf:.3f}x, 整体 RTF: {overall_rtf:.3f}x")
 
         stats = {
             "total_audio_dur_s": total_audio_dur,

@@ -1,0 +1,19 @@
+# Python 字节码缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境（如果用了venv/conda）
+venv/
+env/
+*.env
+
+# 日志/缓存/临时文件
+*.log
+*.tmp
+*.cache
+
+# 打包/安装文件
+dist/
+build/
+*.egg-info/

@@ -166,16 +166,16 @@ class VadPostprocessor:
 
     def _smooth_prob(self, probs):
         if self.smooth_window_size <= 1:
-            return np.asarray(probs)
-        probs_np = np.array(probs)
-        kernel = np.ones(self.smooth_window_size) / self.smooth_window_size
+            return np.asarray(probs, dtype=np.float32)
+        probs_np = np.array(probs, dtype=np.float32)
+        kernel = np.ones(self.smooth_window_size, dtype=np.float32) / self.smooth_window_size
         smoothed = np.convolve(probs_np, kernel, mode='full')[:len(probs)]
         for i in range(min(self.smooth_window_size - 1, len(probs))):
             smoothed[i] = np.mean(probs_np[:i+1])
         return smoothed
 
     def _apply_threshold(self, probs):
-        probs_np = np.asarray(probs)
+        probs_np = np.asarray(probs, dtype=np.float32)
         return (probs_np >= self.prob_threshold).astype(int).tolist()
 
     def _find_split_points(self, probs):

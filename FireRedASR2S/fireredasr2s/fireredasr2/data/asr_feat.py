@@ -2,11 +2,13 @@
 
 import math
 import os
+from typing import List
 
 import kaldi_native_fbank as knf
 import kaldiio
 import numpy as np
 import torch
+import torch.nn.utils.rnn as rnn_utils
 
 
 class ASRFeatExtractor:
@@ -36,7 +38,7 @@ class ASRFeatExtractor:
                 continue
             if self.cmvn is not None:
                 fbank = self.cmvn(fbank)
-            fbank = torch.from_numpy(fbank).float()
+            fbank = torch.from_numpy(fbank)
             feats.append(fbank)
             durs.append(dur)
             return_wav_paths.append(path)
@@ -48,14 +50,18 @@ class ASRFeatExtractor:
             lengths, feats_pad = None, None
         return feats_pad, lengths, durs, return_wav_paths, return_wav_uttids
 
-    def pad_feat(self, xs, pad_value):
-        # type: (List[Tensor], int) -> Tensor
-        n_batch = len(xs)
-        max_len = max([xs[i].size(0) for i in range(n_batch)])
-        pad = torch.ones(n_batch, max_len, *xs[0].size()[1:]).to(xs[0].device).to(xs[0].dtype).fill_(pad_value)
-        for i in range(n_batch):
-            pad[i, :xs[i].size(0)] = xs[i]
-        return pad
+    def pad_feat(self, xs: List[torch.Tensor], pad_value: float) -> torch.Tensor:
+        """
+        使用 pad_sequence 进行特征 padding，支持更高效的内存布局
+        
+        Args:
+            xs: 特征列表，每个元素形状为 (frames, dim)
+            pad_value: padding 填充值
+            
+        Returns:
+            padded: padding 后的张量，形状为 (batch, max_frames, dim)
+        """
+        return rnn_utils.pad_sequence(xs, batch_first=True, padding_value=pad_value)
 
 
 class CMVN:
@@ -87,7 +93,7 @@ class CMVN:
                 varience = floor
             istd = 1.0 / math.sqrt(varience)
             inverse_std_variences.append(istd)
-        return dim, np.array(means), np.array(inverse_std_variences)
+        return dim, np.array(means, dtype=np.float32), np.array(inverse_std_variences, dtype=np.float32)
 
 
 
@@ -117,7 +123,7 @@ class KaldifeatFbank:
         num_frames = fbank.num_frames_ready
         if num_frames == 0:
             print("Check data, len(feat) == 0", wav, flush=True)
-            return np.zeros((0, self.opts.mel_opts.num_bins))
+            return np.zeros((0, self.opts.mel_opts.num_bins), dtype=np.float32)
         feat = np.empty((num_frames, self.opts.mel_opts.num_bins), dtype=np.float32)
         for i in range(num_frames):
             feat[i] = fbank.get_frame(i)

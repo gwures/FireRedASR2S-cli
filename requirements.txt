@@ -8,7 +8,6 @@ sentencepiece>=0.1.99
 soundfile>=0.12.1
 textgrid
 setuptools
-openai
 
 
 

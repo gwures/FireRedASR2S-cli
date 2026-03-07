@@ -9,7 +9,7 @@ FireRedASR2S-cli 是一款基于开源项目 [FireRedASR2S](https://github.com/F
 ## 环境要求
 
 - Python 3.8+（python>=3.12可能需要额外解决soudfile问题）
-- CUDA 
+- Pytorch
 - ffmpeg (用于音频格式转换)
 
 ## 安装步骤
@@ -53,8 +53,9 @@ python download_models.py
 ```
 
 模型将下载到 `pretrained_models/` 目录：
-- `pretrained_models/FireRedVAD/VAD` - VAD模型
+- `pretrained_models/FireRedVAD` - VAD模型
 - `pretrained_models/FireRedASR2-AED` - ASR模型
+- `pretrained_models/FireRedPunc` - Punc模型
 
 ### 5. 开启TF32（可选但推荐）
 
@@ -74,32 +75,15 @@ python cli.py -h
 
 
 简单解释
-- --nfp, --no-fp16     原精度，识别准确率更高，双倍资源消耗，效率更低。
+- --nfp, --no-fp16     原精度（float32），识别准确率更高，双倍资源消耗，效率更低。
 
-- --ts, --timestamp     返回词级时间戳  ：时间戳更精确，但是主观感受不出来，拖慢5%左右效率。
+- --nts, --no-timestamp    不返回词级时间戳  速度快5%，副作用是字幕无法按标点换行，会偶尔出现单行字数过长的现象，不影响准确性。
 
 - --dur SECONDS      单个批次总时长上限。根据GPU实力调整，建议为32的倍数。当前单片段时长为0.5s-16s，每秒为100帧。（见 config.py:"min_speech_frame": 50, "max_speech_frame": 1600，最大为2000否则出错）
 
-（以6G的RTX3060为例，开启游戏模式，RTF在0.03左右）
+（以6G的RTX3060为例，开启游戏模式，默认设置下，RTF在0.03左右）
 
 --BFD  使用BFD算法进行分批。理论上默认的WFD更好，但由于缺乏足够的测试数据，故而保留了旧方法。
-
-
-
-### 标点配置 (config.py - PUNCTUATION_CONFIG)
-
-私以为原标点模型虽然效率极高，但实际效果不理想，故而移除，改用自定义AI模型处理。
-
-| 配置项 | 默认值 | 说明 |
-|--------|--------|------|
-| `enabled` | True | 是否启用标点恢复功能 |
-| `endpoint` | - | 标点恢复API端点，任意兼容openai格式的 |
-| `api_key` | - | API密钥 |
-| `model` | - | 使用的LLM模型 |
-| `prompt` | - | 标点恢复提示词 |
-| `max_timeout` | 600 | API超时时间(秒) |
-
-（请自行去config.py填入相关参数，参数配置错误不会影响任务转写，因为标点是任务结束后的额外操作。）
 
 
 ### 分批策略

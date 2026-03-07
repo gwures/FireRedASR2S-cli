@@ -11,6 +11,7 @@ PRETRAINED_MODELS_DIR.mkdir(exist_ok=True)
 MODEL_PATHS = {
     "vad": str(PRETRAINED_MODELS_DIR / "FireRedVAD" / "VAD"),
     "asr": str(PRETRAINED_MODELS_DIR / "FireRedASR2-AED"),
+    "punc": str(PRETRAINED_MODELS_DIR / "FireRedPunc"),
 }
 
 ASR_CONFIG = {
@@ -37,12 +38,7 @@ VAD_CONFIG = {
     "chunk_max_frame": 30000,
 }
 
-PUNCTUATION_CONFIG = {
-    "enabled": True,
-    "endpoint": "https://api.siliconflow.cn/v1/chat/completions",
-    "api_key": "sk-l4esdghjjjj",
-    "model": "THUDM/GLM-4-9B-0414",
-    "prompt": "为下方无标点的长文本进行标准化标点补全。绝不改动原文任何字词、语序，仅补充标点；不要其他解释：\n{text}",
-    "max_timeout": 600,
-    "max_concurrent": 5,
+PUNC_CONFIG = {
+    "use_gpu": True,
+    "sentence_max_length": -1,
 }

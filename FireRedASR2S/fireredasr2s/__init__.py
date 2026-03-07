@@ -18,6 +18,11 @@ if _PROJECT_ROOT not in sys.path:
 from fireredasr2s.fireredasr2system import (FireRedAsr2System,
                                             FireRedAsr2SystemConfig)
 
+try:
+    from fireredasr2s.fireredpunc import FireRedPunc, FireRedPuncConfig
+except ImportError:
+    pass
+
 # API
 __all__ = [
     "__version__",
@@ -31,4 +36,6 @@ __all__ = [
     "FireRedStreamVadConfig",
     "FireRedAed",
     "FireRedAedConfig",
+    "FireRedPunc",
+    "FireRedPuncConfig",
 ]

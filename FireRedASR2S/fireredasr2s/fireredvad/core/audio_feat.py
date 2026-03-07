@@ -32,7 +32,7 @@ class AudioFeat:
         fbank = self.fbank((sample_rate, wav_np))
         if self.cmvn is not None:
             fbank = self.cmvn(fbank)
-        feat = torch.from_numpy(fbank).float()
+        feat = torch.from_numpy(fbank)
         return feat, dur
 
 
@@ -66,7 +66,7 @@ class CMVN:
                 variance = floor
             istd = 1.0 / math.sqrt(variance)
             inverse_std_variances.append(istd)
-        return dim, np.array(means), np.array(inverse_std_variances)
+        return dim, np.array(means, dtype=np.float32), np.array(inverse_std_variances, dtype=np.float32)
 
 
 
@@ -96,10 +96,10 @@ class KaldifeatFbank:
         fbank = knf.OnlineFbank(self.opts)
 
         fbank.accept_waveform(sample_rate, wav_np)
-        feat = []
-        for i in range(fbank.num_frames_ready):
-            feat.append(fbank.get_frame(i))
-        if len(feat) == 0:
-            return np.zeros((0, self.opts.mel_opts.num_bins))
-        feat = np.vstack(feat)
+        num_frames = fbank.num_frames_ready
+        if num_frames == 0:
+            return np.zeros((0, self.opts.mel_opts.num_bins), dtype=np.float32)
+        feat = np.empty((num_frames, self.opts.mel_opts.num_bins), dtype=np.float32)
+        for i in range(num_frames):
+            feat[i] = fbank.get_frame(i)
         return feat
