@@ -2,8 +2,6 @@
 
 import logging
 import os
-import random
-import re
 
 import torch
 import torch.nn as nn
@@ -12,8 +10,11 @@ from transformers import AutoModelForCausalLM
 from ..models.fireredasr_aed import FireRedAsrAed
 from ..models.module.adapter import Adapter
 from ..models.param import count_model_parameters
-from ..tokenizer.llm_tokenizer import (DEFAULT_SPEECH_TOKEN, IGNORE_TOKEN_ID,
-                                       LlmTokenizerWrapper)
+from ..tokenizer.llm_tokenizer import (
+    DEFAULT_SPEECH_TOKEN,
+    IGNORE_TOKEN_ID,
+    LlmTokenizerWrapper,
+)
 
 
 class FireRedAsrLlm(nn.Module):
@@ -36,7 +37,7 @@ class FireRedAsrLlm(nn.Module):
         encoder, encoder_dim = cls.load_encoder(args.encoder_path)
         count_model_parameters(encoder)
         if args.freeze_encoder:
-            logging.info(f"Frezee encoder")
+            logging.info("Freeze encoder")
             for name, param in encoder.named_parameters():
                 param.requires_grad = False
             encoder.eval()
@@ -65,13 +66,14 @@ class FireRedAsrLlm(nn.Module):
         # LLM Freeze or LoRA
         llm_dim = llm.config.hidden_size
         if args.freeze_llm:
-            logging.info(f"Frezee LLM")
+            logging.info("Freeze LLM")
             for name, param in llm.named_parameters():
                 param.requires_grad = False
             llm.eval()
         else:
             if args.use_lora:
                 from peft import LoraConfig, get_peft_model
+
                 lora_config = LoraConfig(
                     r=64,
                     lora_alpha=16,
@@ -91,7 +93,9 @@ class FireRedAsrLlm(nn.Module):
                 llm.print_trainable_parameters()
 
         tokenizer = LlmTokenizerWrapper.build_llm_tokenizer(args.llm_dir)
-        assert tokenizer.pad_token_id == tokenizer.convert_tokens_to_ids("<|endoftext|>")
+        assert tokenizer.pad_token_id == tokenizer.convert_tokens_to_ids(
+            "<|endoftext|>"
+        )
         llm.config.pad_token_id = tokenizer.pad_token_id
         llm.config.bos_token_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
         llm.config.eos_token_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
@@ -100,15 +104,14 @@ class FireRedAsrLlm(nn.Module):
         )
 
         # Build projector
-        encoder_projector = Adapter(
-            encoder_dim, llm_dim, args.encoder_downsample_rate)
+        encoder_projector = Adapter(encoder_dim, llm_dim, args.encoder_downsample_rate)
         count_model_parameters(encoder_projector)
 
-        return cls(encoder, llm, encoder_projector,
-                   args.freeze_encoder, args.freeze_llm)
+        return cls(
+            encoder, llm, encoder_projector, args.freeze_encoder, args.freeze_llm
+        )
 
-    def __init__(self, encoder, llm, encoder_projector,
-                 freeze_encoder, freeze_llm):
+    def __init__(self, encoder, llm, encoder_projector, freeze_encoder, freeze_llm):
         super().__init__()
         self.encoder = encoder
         self.llm = llm
@@ -118,20 +121,34 @@ class FireRedAsrLlm(nn.Module):
         self.freeze_llm = freeze_llm
         self.llm_config = llm.config
 
-    def transcribe(self, padded_feat, feat_lengths, padded_input_ids, attention_mask,
-                   beam_size=1, decode_max_len=0, decode_min_len=0,
-                   repetition_penalty=1.0, llm_length_penalty=1.0, temperature=1.0):
+    def transcribe(
+        self,
+        padded_feat,
+        feat_lengths,
+        padded_input_ids,
+        attention_mask,
+        beam_size=1,
+        decode_max_len=0,
+        decode_min_len=0,
+        repetition_penalty=1.0,
+        llm_length_penalty=1.0,
+        temperature=1.0,
+    ):
         encoder_outs, enc_lengths, enc_mask = self.encoder(padded_feat, feat_lengths)
         speech_features, speech_lens = self.encoder_projector(encoder_outs, enc_lengths)
         inputs_embeds = self.llm.get_input_embeddings()(padded_input_ids)
 
-        inputs_embeds, attention_mask, _ = \
-            self._merge_input_ids_with_speech_features(
-                speech_features.to(inputs_embeds.dtype), inputs_embeds, padded_input_ids, attention_mask,
-                speech_lens=speech_lens
-            )
+        inputs_embeds, attention_mask, _ = self._merge_input_ids_with_speech_features(
+            speech_features.to(inputs_embeds.dtype),
+            inputs_embeds,
+            padded_input_ids,
+            attention_mask,
+            speech_lens=speech_lens,
+        )
 
-        max_new_tokens = speech_features.size(1) if decode_max_len < 1 else decode_max_len
+        max_new_tokens = (
+            speech_features.size(1) if decode_max_len < 1 else decode_max_len
+        )
         max_new_tokens = max(1, max_new_tokens)
 
         generated_ids = self.llm.generate(
@@ -151,10 +168,14 @@ class FireRedAsrLlm(nn.Module):
 
         return generated_ids
 
-
     def _merge_input_ids_with_speech_features(
-        self, speech_features, inputs_embeds, input_ids, attention_mask, labels=None,
-        speech_lens=None
+        self,
+        speech_features,
+        inputs_embeds,
+        input_ids,
+        attention_mask,
+        labels=None,
+        speech_lens=None,
     ):
         """
         Modified from: https://github.com/k2-fsa/icefall/blob/master/egs/speech_llm/ASR_LLM/whisper_llm_zh/model.py
@@ -271,4 +292,4 @@ class FireRedAsrLlm(nn.Module):
         if labels is None:
             final_labels = None
 
-        return final_embedding, final_attention_mask, final_labels #, position_ids
+        return final_embedding, final_attention_mask, final_labels  # , position_ids

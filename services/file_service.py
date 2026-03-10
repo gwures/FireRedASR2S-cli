@@ -9,7 +9,7 @@ import weakref
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, List, Optional, Set, Tuple
+from typing import Callable, List, Optional, Set, Tuple, Union
 
 logger = logging.getLogger("fireredasr2s.file_service")
 
@@ -17,7 +17,6 @@ _file_service_instances: Set[weakref.ref] = set()
 
 
 def _cleanup_all_instances():
-    global _file_service_instances
     for ref in list(_file_service_instances):
         instance = ref()
         if instance is not None:
@@ -101,8 +100,8 @@ def validate_file(file_path: Path) -> Tuple[bool, str]:
 def collect_audio_files(
     paths: List[str],
     recursive: bool = False,
-    on_error: Callable[[str, str], None] = None,
-    on_skip: Callable[[str, str], None] = None,
+    on_error: Optional[Callable[[str, str], None]] = None,
+    on_skip: Optional[Callable[[str, str], None]] = None,
 ) -> List[Path]:
     """Collect audio files from given paths.
 
@@ -141,7 +140,10 @@ def collect_audio_files(
         elif path.is_dir():
             pattern = "**/*" if recursive else "*"
             for found_path in path.glob(pattern):
-                if found_path.is_file() and found_path.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS:
+                if (
+                    found_path.is_file()
+                    and found_path.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS
+                ):
                     abs_path = found_path.resolve()
                     filename = abs_path.name
                     if filename not in seen_names:
@@ -164,7 +166,13 @@ class FFmpegNotFoundError(FileServiceError):
 
 
 class FFmpegConversionError(FileServiceError):
-    def __init__(self, message: str, returncode: int = None, stdout: str = None, stderr: str = None):
+    def __init__(
+        self,
+        message: str,
+        returncode: Optional[int] = None,
+        stdout: Optional[str] = None,
+        stderr: Optional[str] = None,
+    ):
         super().__init__(message)
         self.returncode = returncode
         self.stdout = stdout
@@ -268,7 +276,7 @@ class FileService:
             sanitized = f"file_{int(time.time())}"
         return sanitized[:64]
 
-    def _do_convert(self, input_path: Path, output_path: Path) -> str:
+    def _execute_conversion(self, input_path: Path, output_path: Path) -> str:
         input_path = Path(input_path)
 
         if not input_path.exists():
@@ -310,7 +318,9 @@ class FileService:
             self._track_temp_file(str(output_path))
             return str(output_path)
         except FileNotFoundError:
-            raise FFmpegNotFoundError("FFmpeg executable not found. Please install FFmpeg.")
+            raise FFmpegNotFoundError(
+                "FFmpeg executable not found. Please install FFmpeg."
+            )
         except subprocess.TimeoutExpired as e:
             error_msg = f"FFmpeg conversion timed out for {input_path} (timeout=600s)"
             logger.error(error_msg)
@@ -334,7 +344,7 @@ class FileService:
         except OSError as e:
             raise FileServiceError(f"OS error during conversion: {e}") from e
 
-    def _convert_with_result(self, input_path: str) -> ConversionResult:
+    def _convert_single_file(self, input_path: str) -> ConversionResult:
         """Internal method that performs conversion and returns detailed result.
 
         This is the single entry point for all conversion logic, ensuring
@@ -350,11 +360,9 @@ class FileService:
         output_path = self._get_output_path(input_path_obj)
 
         try:
-            output = self._do_convert(input_path_obj, output_path)
+            output = self._execute_conversion(input_path_obj, output_path)
             return ConversionResult(
-                input_path=input_path,
-                output_path=output,
-                success=True
+                input_path=input_path, output_path=output, success=True
             )
         except FFmpegConversionError as e:
             error_msg = f"Return code {e.returncode}: {e.stderr}"
@@ -364,7 +372,7 @@ class FileService:
                 output_path=None,
                 success=False,
                 error_message=error_msg,
-                exception=e
+                exception=e,
             )
         except Exception as e:
             error_msg = str(e)
@@ -374,13 +382,15 @@ class FileService:
                 output_path=None,
                 success=False,
                 error_message=error_msg,
-                exception=e
+                exception=e,
             )
 
     def convert(
         self,
         input_paths: List[str],
-        progress_callback: Callable[[int, int, ConversionResult], None] = None,
+        progress_callback: Optional[
+            Callable[[int, int, ConversionResult], None]
+        ] = None,
     ) -> List[ConversionResult]:
         """Convert audio files to WAV format concurrently.
 
@@ -418,10 +428,10 @@ class FileService:
                         print(f"FAIL: {r.error_message}")
         """
         future_to_index = {
-            self._executor.submit(self._convert_with_result, path): idx
+            self._executor.submit(self._convert_single_file, path): idx
             for idx, path in enumerate(input_paths)
         }
-        results: List[ConversionResult] = [None] * len(input_paths)
+        results: List[ConversionResult] = [None] * len(input_paths)  # type: ignore
         completed = 0
 
         for future in as_completed(future_to_index):
@@ -435,7 +445,7 @@ class FileService:
                     output_path=None,
                     success=False,
                     error_message=str(e),
-                    exception=e
+                    exception=e,
                 )
             completed += 1
             if progress_callback:
@@ -443,7 +453,9 @@ class FileService:
 
         return results
 
-    def cleanup_temp_files(self, file_paths: List[str], on_progress: Callable[[str], None] = None) -> Tuple[int, int]:
+    def cleanup_temp_files(
+        self, file_paths: List[str], on_progress: Optional[Callable[[str], None]] = None
+    ) -> Tuple[int, int]:
         """Clean up temporary files.
 
         Args:

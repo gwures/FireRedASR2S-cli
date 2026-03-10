@@ -1,5 +1,6 @@
 # Copyright 2026 Xiaohongshu. (Author: Kaituo Xu, Junjie Chen)
 
+import gc
 import logging
 import os
 import re
@@ -8,11 +9,39 @@ from dataclasses import dataclass
 import torch
 
 from .data.hf_bert_tokenizer import HfBertTokenizer
+from .data.token_dict import TokenDict
 from .models.fireredpunc_bert import FireRedPuncBert
 from .models.param import count_model_parameters
-from .data.token_dict import TokenDict
 
 logger = logging.getLogger(__name__)
+
+_RE_BERT_PREFIX = re.compile(r"^##")
+_RE_ALNUM_SINGLE = re.compile(r"[a-zA-Z0-9']")
+_RE_ALNUM_HASH = re.compile(r"[a-zA-Z0-9#]+")
+_RE_PUNC_CN_EN_1 = re.compile(r"([a-z])，([a-z])")
+_RE_PUNC_CN_EN_2 = re.compile(r"([a-z])。([a-z])")
+_RE_PUNC_CN_EN_3 = re.compile(r"([a-z])？([a-z])")
+_RE_PUNC_CN_EN_4 = re.compile(r"([a-z])！([a-z])")
+_RE_PUNC_START_1 = re.compile(r"^([a-z]+)，")
+_RE_PUNC_START_2 = re.compile(r"^([a-z]+)。")
+_RE_PUNC_START_3 = re.compile(r"^([a-z]+)？")
+_RE_PUNC_START_4 = re.compile(r"^([a-z]+)！")
+_RE_PUNC_END_1 = re.compile(r"( [a-zA-Z']+)，$")
+_RE_PUNC_END_2 = re.compile(r"( [a-zA-Z']+)。$")
+_RE_PUNC_END_3 = re.compile(r"( [a-zA-Z']+)？$")
+_RE_PUNC_END_4 = re.compile(r"( [a-zA-Z']+)！$")
+_RE_I_START = re.compile(r"^i ")
+_RE_IM_START = re.compile(r"^i'm ")
+_RE_ID_START = re.compile(r"^i'd ")
+_RE_IVE_START = re.compile(r"^i've ")
+_RE_ILL_START = re.compile(r"^i'll ")
+_RE_I_SPACE = re.compile(r" i ")
+_RE_IM_SPACE = re.compile(r" i'm ")
+_RE_ID_SPACE = re.compile(r" i'd ")
+_RE_IVE_SPACE = re.compile(r" i've ")
+_RE_ILL_SPACE = re.compile(r" i'll ")
+_RE_SENTENCE_START = re.compile(r"[a-z]")
+_RE_PUNC_AFTER = re.compile(r"([.!?。？！])\s+([a-z])")
 
 
 @dataclass
@@ -40,11 +69,27 @@ class FireRedPunc:
         else:
             self.model.cpu()
 
-    @torch.no_grad()
+    def release_resources(self):
+        if hasattr(self, "model"):
+            del self.model
+            self.model = None
+        if hasattr(self, "model_io"):
+            del self.model_io
+            self.model_io = None
+
+        gc.collect()
+        if self.config.use_gpu and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+        logger.info("FireRedPunc resources released")
+
+    @torch.inference_mode()
     def process(self, batch_text, batch_uttid=None):
         padded_inputs, lengths, txt_tokens = self.model_io.text2tensor(batch_text)
         if self.config.use_gpu:
-            padded_inputs, lengths = padded_inputs.cuda(), lengths.cuda()
+            padded_inputs = padded_inputs.to(device="cuda", non_blocking=True)
+            lengths = lengths.to(device="cuda", non_blocking=True)
 
         logits = self.model.forward_model(padded_inputs, lengths)
         preds = self.get_punc_pred(logits, lengths)
@@ -52,6 +97,7 @@ class FireRedPunc:
         punc_txts = self.model_io.add_punc_to_txt(txt_tokens, preds)
         punc_txts = [RuleBaedTxtFix.fix(txt) for txt in punc_txts]
 
+        del padded_inputs, lengths, logits, preds
         results = []
         for i in range(len(batch_text)):
             result = {
@@ -63,19 +109,23 @@ class FireRedPunc:
             results.append(result)
         return results
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def process_with_timestamp(self, batch_timestamp, batch_uttid=None):
-        padded_inputs, lengths, batch_txt_tokens, batch_tokens_split_num = \
+        padded_inputs, lengths, batch_txt_tokens, batch_tokens_split_num = (
             self.model_io.timestamp2tensor(batch_timestamp)
+        )
         if self.config.use_gpu:
-            padded_inputs, lengths = padded_inputs.cuda(), lengths.cuda()
+            padded_inputs = padded_inputs.to(device="cuda", non_blocking=True)
+            lengths = lengths.to(device="cuda", non_blocking=True)
 
         logits = self.model.forward_model(padded_inputs, lengths)
         preds = self.get_punc_pred(logits, lengths, batch_txt_tokens)
 
         punc_txts = self.model_io.add_punc_to_txt_with_timestamp(
-            batch_txt_tokens, preds, batch_timestamp, batch_tokens_split_num)
+            batch_txt_tokens, preds, batch_timestamp, batch_tokens_split_num
+        )
 
+        del padded_inputs, lengths, logits, preds
         new_punc_txts = []
         for txts in punc_txts:
             new_txts = []
@@ -84,8 +134,10 @@ class FireRedPunc:
                     cap = True
                 else:
                     prev_text = new_txts[idx - 1][0]
-                    cap = bool(prev_text) and prev_text[-1] in '.!?。？！'
-                new_txts.append((RuleBaedTxtFix.fix(txt[0], capitalize_first=cap), txt[1], txt[2]))
+                    cap = bool(prev_text) and prev_text[-1] in ".!?。？！"
+                new_txts.append(
+                    (RuleBaedTxtFix.fix(txt[0], capitalize_first=cap), txt[1], txt[2])
+                )
             new_punc_txts.append(new_txts)
         punc_txts = new_punc_txts
 
@@ -93,7 +145,8 @@ class FireRedPunc:
         for i in range(len(batch_timestamp)):
             result = {
                 "punc_sentences": [
-                    {"punc_text": t[0], "start_s": t[1], "end_s": t[2]} for t in punc_txts[i]
+                    {"punc_text": t[0], "start_s": t[1], "end_s": t[2]}
+                    for t in punc_txts[i]
                 ],
             }
             if batch_uttid is not None:
@@ -103,13 +156,18 @@ class FireRedPunc:
 
     def get_punc_pred(self, punc_logits, lengths, batch_txt_tokens=None):
         max_len = torch.max(lengths).cpu().item()
-        if max_len <= self.config.sentence_max_length or self.config.sentence_max_length <= 0 or batch_txt_tokens is None:
+        if (
+            max_len <= self.config.sentence_max_length
+            or self.config.sentence_max_length <= 0
+            or batch_txt_tokens is None
+        ):
             _, preds = torch.max(punc_logits, dim=-1)
             preds = preds.cpu().tolist()
-            preds = [pred[:lengths[i]] for i, pred in enumerate(preds)]
+            preds = [pred[: lengths[i]] for i, pred in enumerate(preds)]
         else:
-            preds = self.get_punc_pred_limit_max_len(punc_logits, lengths,
-                                                     batch_txt_tokens)
+            preds = self.get_punc_pred_limit_max_len(
+                punc_logits, lengths, batch_txt_tokens
+            )
         return preds
 
     def get_punc_pred_limit_max_len(self, punc_logits, lengths, batch_txt_tokens):
@@ -130,14 +188,17 @@ class FireRedPunc:
                 max_index = -1
                 while r < L:
                     token_num = 0.0
-                    s = re.sub("^##", "", tokens[r])
+                    s = _RE_BERT_PREFIX.sub("", tokens[r])
                     for j in range(len(s)):
-                        if re.match("[a-zA-Z0-9']", s[j]):
+                        if _RE_ALNUM_SINGLE.match(s[j]):
                             token_num += 0.5
                         else:
                             token_num += 1
 
-                    if total_num + token_num > sentence_max_length and max_seg_prob >= 0:
+                    if (
+                        total_num + token_num > sentence_max_length
+                        and max_seg_prob >= 0
+                    ):
                         break
 
                     space_prob = probs[r][0]
@@ -154,7 +215,9 @@ class FireRedPunc:
                 else:
                     r = max_index
                 if token_num > sentence_max_length:
-                    logger.info(f"Too long token...{n}, {l}, {r}, {total_num}, {token_num}, {tokens[l]}, {tokens[r]}")
+                    logger.info(
+                        f"Too long token...{n}, {l}, {r}, {total_num}, {token_num}, {tokens[l]}, {tokens[r]}"
+                    )
                 for idx in range(l, r):
                     single_sentence_seg_token_ids.append(0)
                 pred_id = 1
@@ -171,7 +234,9 @@ class FireRedPunc:
 
 def load_punc_bert_model(model_dir):
     model_path = os.path.join(model_dir, "model.pth.tar")
-    package = torch.load(model_path, map_location=lambda storage, loc: storage, weights_only=False)
+    package = torch.load(
+        model_path, map_location=lambda storage, loc: storage, weights_only=False
+    )
     package["args"].bert = None
     package["args"].pretrained_bert = os.path.join(model_dir, "chinese-lert-base")
     model = FireRedPuncBert.from_args(package["args"])
@@ -182,7 +247,9 @@ def load_punc_bert_model(model_dir):
 class ModelIO:
     def __init__(self, model_dir):
         self.tokenizer = HfBertTokenizer(os.path.join(model_dir, "chinese-lert-base"))
-        self.in_dict = TokenDict(os.path.join(model_dir, "chinese-bert-wwm-ext_vocab.txt"), unk="[UNK]")
+        self.in_dict = TokenDict(
+            os.path.join(model_dir, "chinese-bert-wwm-ext_vocab.txt"), unk="[UNK]"
+        )
         self.out_dict = TokenDict(os.path.join(model_dir, "out_dict"), unk="")
         self.INPUT_IGNORE_ID = self.in_dict["[PAD]"]
         self.DEFAULT_OUT = " "
@@ -223,7 +290,9 @@ class ModelIO:
     @classmethod
     def pad_list(cls, input_seqs, pad_value):
         lengths = [len(seq) for seq in input_seqs]
-        padded_inputs = torch.zeros(len(input_seqs), max(lengths)).fill_(pad_value).long()
+        padded_inputs = (
+            torch.zeros(len(input_seqs), max(lengths)).fill_(pad_value).long()
+        )
         for i, input_seq in enumerate(input_seqs):
             end = lengths[i]
             padded_inputs[i, :end] = torch.LongTensor(input_seq[:end])
@@ -240,9 +309,12 @@ class ModelIO:
 
                 if token.startswith("##"):
                     token = token.replace("##", "")
-                elif re.search("[a-zA-Z0-9#]+", token) and \
-                     i > 0 and re.search("[a-zA-Z0-9#]+", token_seq[i-1]):
-                    if self.out_dict[pred_seq[i-1]] == self.DEFAULT_OUT:
+                elif (
+                    _RE_ALNUM_HASH.match(token)
+                    and i > 0
+                    and _RE_ALNUM_HASH.match(token_seq[i - 1])
+                ):
+                    if self.out_dict[pred_seq[i - 1]] == self.DEFAULT_OUT:
                         token = " " + token
 
                 if tag == self.DEFAULT_OUT:
@@ -253,11 +325,13 @@ class ModelIO:
             punc_txts.append(txt)
         return punc_txts
 
-    def add_punc_to_txt_with_timestamp(self, token_seqs, pred_seqs,
-                                       batch_timestamp, batch_tokens_split_num):
+    def add_punc_to_txt_with_timestamp(
+        self, token_seqs, pred_seqs, batch_timestamp, batch_tokens_split_num
+    ):
         punc_txts = []
-        for token_seq, pred_seq, timestamps, tokens_split_num in \
-                zip(token_seqs, pred_seqs, batch_timestamp, batch_tokens_split_num):
+        for token_seq, pred_seq, timestamps, tokens_split_num in zip(
+            token_seqs, pred_seqs, batch_timestamp, batch_tokens_split_num
+        ):
             assert len(token_seq) == len(pred_seq)
             sentences = []
             txt, start, end = "", -1, -1
@@ -276,7 +350,7 @@ class ModelIO:
                 for k in range(split_num):
                     sub_token = token_seq[i]
                     tag = self.out_dict[pred_seq[i]]
-                    sub_token = re.sub("^##", "", sub_token)
+                    sub_token = _RE_BERT_PREFIX.sub("", sub_token)
                     if k == 0:
                         token = sub_token
                     else:
@@ -284,8 +358,11 @@ class ModelIO:
                     i += 1
                 assert token == timestamp[0], f"{token}/{timestamp}"
                 j += 1
-                if re.search("[a-zA-Z0-9#]+", token) and \
-                     j > 0 and re.search("[a-zA-Z0-9#]+", last_token):
+                if (
+                    _RE_ALNUM_HASH.match(token)
+                    and j > 0
+                    and _RE_ALNUM_HASH.match(last_token)
+                ):
                     if last_tag == self.DEFAULT_OUT:
                         token = " " + token
 
@@ -311,30 +388,30 @@ class RuleBaedTxtFix:
     @classmethod
     def fix(cls, txt_ori, capitalize_first=True):
         txt = txt_ori.lower()
-        txt = re.sub(r"([a-z])，([a-z])", r"\1, \2", txt)
-        txt = re.sub(r"([a-z])。([a-z])", r"\1. \2", txt)
-        txt = re.sub(r"([a-z])？([a-z])", r"\1? \2", txt)
-        txt = re.sub(r"([a-z])！([a-z])", r"\1! \2", txt)
-        txt = re.sub(r"^([a-z]+)，", r"\1,", txt)
-        txt = re.sub(r"^([a-z]+)。", r"\1.", txt)
-        txt = re.sub(r"^([a-z]+)？", r"\1?", txt)
-        txt = re.sub(r"^([a-z]+)！", r"\1!", txt)
-        txt = re.sub(r"( [a-zA-Z']+)，$", r"\1,", txt)
-        txt = re.sub(r"( [a-zA-Z']+)。$", r"\1.", txt)
-        txt = re.sub(r"( [a-zA-Z']+)？$", r"\1?", txt)
-        txt = re.sub(r"( [a-zA-Z']+)！$", r"\1!", txt)
-        txt = re.sub("^i ", "I ", txt)
-        txt = re.sub("^i'm ", "I'm ", txt)
-        txt = re.sub("^i'd ", "I'd ", txt)
-        txt = re.sub("^i've ", "I've ", txt)
-        txt = re.sub("^i'll ", "I'll ", txt)
-        txt = re.sub(" i ", " I ", txt)
-        txt = re.sub(" i'm ", " I'm ", txt)
-        txt = re.sub(" i'd ", " I'd ", txt)
-        txt = re.sub(" i've ", " I've ", txt)
-        txt = re.sub(" i'll ", " I'll ", txt)
-        if capitalize_first and len(txt) > 0 and re.match("[a-z]", txt[0]):
+        txt = _RE_PUNC_CN_EN_1.sub(r"\1, \2", txt)
+        txt = _RE_PUNC_CN_EN_2.sub(r"\1. \2", txt)
+        txt = _RE_PUNC_CN_EN_3.sub(r"\1? \2", txt)
+        txt = _RE_PUNC_CN_EN_4.sub(r"\1! \2", txt)
+        txt = _RE_PUNC_START_1.sub(r"\1,", txt)
+        txt = _RE_PUNC_START_2.sub(r"\1.", txt)
+        txt = _RE_PUNC_START_3.sub(r"\1?", txt)
+        txt = _RE_PUNC_START_4.sub(r"\1!", txt)
+        txt = _RE_PUNC_END_1.sub(r"\1,", txt)
+        txt = _RE_PUNC_END_2.sub(r"\1.", txt)
+        txt = _RE_PUNC_END_3.sub(r"\1?", txt)
+        txt = _RE_PUNC_END_4.sub(r"\1!", txt)
+        txt = _RE_I_START.sub("I ", txt)
+        txt = _RE_IM_START.sub("I'm ", txt)
+        txt = _RE_ID_START.sub("I'd ", txt)
+        txt = _RE_IVE_START.sub("I've ", txt)
+        txt = _RE_ILL_START.sub("I'll ", txt)
+        txt = _RE_I_SPACE.sub(" I ", txt)
+        txt = _RE_IM_SPACE.sub(" I'm ", txt)
+        txt = _RE_ID_SPACE.sub(" I'd ", txt)
+        txt = _RE_IVE_SPACE.sub(" I've ", txt)
+        txt = _RE_ILL_SPACE.sub(" I'll ", txt)
+        if capitalize_first and len(txt) > 0 and _RE_SENTENCE_START.match(txt[0]):
             txt = txt[0].upper() + txt[1:]
-        txt = re.sub(r'([.!?。？！])\s+([a-z])', lambda m: f"{m.group(1)} {m.group(2).upper()}", txt)
+        txt = _RE_PUNC_AFTER.sub(lambda m: f"{m.group(1)} {m.group(2).upper()}", txt)
 
         return txt

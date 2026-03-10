@@ -67,7 +67,6 @@ def write_event_textgrid(wav_path, wav_dur, event2starts_ends_s):
     textgrid.write(textgrid_file)
 
 
-
 def split_and_save_segment(wav_path, timestamps, save_segment_dir):
     logger.info("Split & save segment")
     os.makedirs(save_segment_dir, exist_ok=True)
@@ -102,6 +101,9 @@ def timeit(func):
         elapsed = time.time() - start
         dur = r[-1]
         rtf = elapsed / dur if dur else 0
-        logger.info(f"RTF={round(rtf, 5)}, elapsed={round(elapsed*1000, 2)}ms, dur={dur}s")
+        logger.info(
+            f"RTF={round(rtf, 5)}, elapsed={round(elapsed*1000, 2)}ms, dur={dur}s"
+        )
         return r
+
     return wrapper

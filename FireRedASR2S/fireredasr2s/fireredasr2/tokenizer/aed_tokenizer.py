@@ -1,6 +1,5 @@
 # Copyright 2026 Xiaohongshu. (Author: Kaituo Xu)
 
-import logging
 import re
 
 import sentencepiece as spm
@@ -17,8 +16,9 @@ class ChineseCharEnglishSpmTokenizer:
     - Need to put SPM piece into dict file
     - If not set spm_model, will use English char and <space>
     """
+
     SPM_SPACE = "▁"
-    _CHINESE_CHAR_PATTERN = re.compile(r'([\u3400-\u4dbf\u4e00-\u9fff])')
+    _CHINESE_CHAR_PATTERN = re.compile(r"([\u3400-\u4dbf\u4e00-\u9fff])")
     _ENGLISH_PATTERN = re.compile(r"^[a-zA-Z']+$")
     _PUNC_PATTERN = re.compile(r"[，。？！,\.?!]")
 
@@ -36,7 +36,7 @@ class ChineseCharEnglishSpmTokenizer:
                 print("Please add <space> to your dict, or it will be <unk>")
 
     def tokenize(self, text, replace_punc=True):
-        #if text == "":
+        # if text == "":
         #    logging.info(f"empty text")
         text = text.upper()
         tokens = []
@@ -67,7 +67,7 @@ class ChineseCharEnglishSpmTokenizer:
             tokens = inputs
         s = f"{join_symbol}".join(tokens)
         if replace_spm_space:
-            s = s.replace(self.SPM_SPACE, ' ').strip()
+            s = s.replace(self.SPM_SPACE, " ").strip()
         return s
 
     def merge_spm_timestamp(self, timestamp):

@@ -30,7 +30,7 @@ VAD_CONFIG = {
     "use_gpu": True,
     "smooth_window_size": 5,
     "speech_threshold": 0.4,
-    "min_speech_frame": 50,
+    "min_speech_frame": 64,
     "max_speech_frame": 1600,
     "min_silence_frame": 20,
     "merge_silence_frame": 0,

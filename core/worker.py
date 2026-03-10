@@ -1,7 +1,9 @@
+import gc
 import heapq
 import logging
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -55,6 +57,78 @@ class AudioProcessResult:
 
 
 logger = logging.getLogger("fireredasr2s.worker")
+
+_asr_system_instance: Optional["MixedASRSystem"] = None
+_asr_system_lock = threading.Lock()
+_asr_system_config_hash: Optional[str] = None
+
+
+def _compute_config_hash(config: Dict[str, Any]) -> str:
+    import hashlib
+    import json
+
+    hashable_keys = ["model_paths", "asr", "vad", "punc", "max_batch_dur_s", "use_bfd"]
+    hashable_config = {k: v for k, v in config.items() if k in hashable_keys}
+
+    config_str = json.dumps(hashable_config, sort_keys=True, default=str)
+    return hashlib.md5(config_str.encode()).hexdigest()
+
+
+def get_or_create_asr_system(config: Dict[str, Any]) -> "MixedASRSystem":
+    global _asr_system_instance, _asr_system_config_hash
+
+    config_hash = _compute_config_hash(config)
+
+    with _asr_system_lock:
+        if _asr_system_instance is not None and _asr_system_config_hash == config_hash:
+            logger.info("Reusing existing MixedASRSystem instance")
+            return _asr_system_instance
+
+        if _asr_system_instance is not None:
+            logger.warning("Config changed, releasing old MixedASRSystem instance")
+            if hasattr(_asr_system_instance, "release_resources"):
+                _asr_system_instance.release_resources()
+            _asr_system_instance = None
+            gc.collect()
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+            except ImportError:
+                pass
+
+        logger.info("Creating new MixedASRSystem instance")
+        _asr_system_instance = MixedASRSystem(config)
+        _asr_system_config_hash = config_hash
+        return _asr_system_instance
+
+
+def release_asr_system():
+    global _asr_system_instance, _asr_system_config_hash
+
+    with _asr_system_lock:
+        if _asr_system_instance is not None:
+            logger.info("Releasing MixedASRSystem instance")
+
+            if hasattr(_asr_system_instance, "release_resources"):
+                _asr_system_instance.release_resources()
+
+            _asr_system_instance = None
+            _asr_system_config_hash = None
+
+            for _ in range(3):
+                gc.collect()
+
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+            except ImportError:
+                pass
 
 
 class MixedASRSystem:
@@ -116,13 +190,93 @@ class MixedASRSystem:
         self.punc = FireRedPunc.from_pretrained(punc_model_path, config)
         logger.info("Punc model loaded!")
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release_resources()
+        return False
+
+    def release_resources(self):
+        if hasattr(self, "vad"):
+            del self.vad
+            self.vad = None
+        if hasattr(self, "asr"):
+            del self.asr
+            self.asr = None
+        if hasattr(self, "punc"):
+            del self.punc
+            self.punc = None
+
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
+
+        logger.info("MixedASRSystem resources released")
+
     @staticmethod
     def _load_audio(audio_path: str) -> np.ndarray:
         audio_data, _ = sf.read(audio_path, dtype="int16")
-        return audio_data
+        return audio_data.astype(np.float32)
 
     @staticmethod
-    def _split_vad_to_batches_bfd(
+    def _get_gpu_memory_info() -> Optional[Dict[str, float]]:
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated() / (1024**3)
+                reserved = torch.cuda.memory_reserved() / (1024**3)
+                max_allocated = torch.cuda.max_memory_allocated() / (1024**3)
+                return {
+                    "allocated_gb": round(allocated, 2),
+                    "reserved_gb": round(reserved, 2),
+                    "max_allocated_gb": round(max_allocated, 2),
+                }
+        except ImportError:
+            pass
+        return None
+
+    @staticmethod
+    def _cleanup_resources(force_cuda_cache: bool = True):
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                if force_cuda_cache:
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                    logger.debug("CUDA cache cleared")
+        except ImportError:
+            pass
+
+    def _check_memory_pressure(self) -> bool:
+        mem_info = self._get_gpu_memory_info()
+        if mem_info is None:
+            return False
+
+        import torch
+
+        if torch.cuda.is_available():
+            total_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            usage_ratio = mem_info["allocated_gb"] / total_memory
+            if usage_ratio > 0.90:
+                logger.warning(
+                    f"High GPU memory usage: {mem_info['allocated_gb']:.2f}GB / "
+                    f"{total_memory:.2f}GB ({usage_ratio*100:.1f}%)"
+                )
+                return True
+        return False
+
+    @staticmethod
+    def _batch_segments_bfd(
         segments: List[VadSegment],
         max_batch_dur_s=64,
         max_bucket_num=5,
@@ -207,7 +361,11 @@ class MixedASRSystem:
                         new_valid_dur = valid_dur + dur
                         new_max_len = max(max_len, dur)
                         new_seg_idxs = seg_idxs + [idx]
-                        batch_state[target_batch_id] = (new_valid_dur, new_max_len, new_seg_idxs)
+                        batch_state[target_batch_id] = (
+                            new_valid_dur,
+                            new_max_len,
+                            new_seg_idxs,
+                        )
                         new_R = max_batch_dur_s - new_valid_dur
                         heapq.heappush(min_heap, (new_R, target_batch_id))
                     else:
@@ -264,7 +422,7 @@ class MixedASRSystem:
         return all_batches
 
     @staticmethod
-    def _split_vad_to_batches_wfd(
+    def _batch_segments_wfd(
         segments: List[VadSegment], max_batch_dur_s=64, max_bucket_num=5, max_ratio=2
     ):
         """
@@ -329,7 +487,7 @@ class MixedASRSystem:
         return all_batches
 
     @staticmethod
-    def split_vad_to_batches(
+    def batch_vad_segments(
         segments: List[VadSegment],
         max_batch_dur_s=64,
         max_bucket_num=5,
@@ -346,16 +504,16 @@ class MixedASRSystem:
         :return: 分批后的片段索引列表
         """
         if use_bfd:
-            return MixedASRSystem._split_vad_to_batches_bfd(
+            return MixedASRSystem._batch_segments_bfd(
                 segments, max_batch_dur_s, max_bucket_num, max_ratio
             )
         else:
-            return MixedASRSystem._split_vad_to_batches_wfd(
+            return MixedASRSystem._batch_segments_wfd(
                 segments, max_batch_dur_s, max_bucket_num, max_ratio
             )
 
     @staticmethod
-    def _split_batch_by_duration(
+    def _subdivide_batch_by_duration(
         audio_durs: List[float], target_dur: float
     ) -> List[List[int]]:
         """
@@ -384,12 +542,12 @@ class MixedASRSystem:
 
         return sub_batches
 
-    def _process_batch_with_adaptive_fallback(
+    def _transcribe_batch_with_fallback(
         self,
         uttids: List[str],
         wavs: List[Tuple],
         audio_durs: List[float],
-        current_max_dur: float = None,
+        current_max_dur: Optional[float] = None,
         min_dur_s: float = 8.0,
     ) -> Tuple[Dict, Dict, int]:
         """
@@ -474,7 +632,7 @@ class MixedASRSystem:
                 target_dur = max(target_dur, min_dur_s)
                 logger.info(f"Retrying with target_dur={target_dur:.1f}s")
 
-                sub_batch_indices = self._split_batch_by_duration(
+                sub_batch_indices = self._subdivide_batch_by_duration(
                     audio_durs, target_dur
                 )
 
@@ -484,7 +642,7 @@ class MixedASRSystem:
                     sub_audio_durs = [audio_durs[i] for i in sub_indices]
 
                     sub_result, sub_dur, sub_failed = (
-                        self._process_batch_with_adaptive_fallback(
+                        self._transcribe_batch_with_fallback(
                             sub_uttids,
                             sub_wavs,
                             sub_audio_durs,
@@ -505,6 +663,130 @@ class MixedASRSystem:
 
         return uttid2result, uttid2audio_dur, failed_count
 
+    def _transcribe_batch_from_cache_with_fallback(
+        self,
+        cached_fbank,
+        segment_infos: List[Tuple[int, int, str, float]],
+        audio_durs: List[float],
+        current_max_dur: Optional[float] = None,
+        min_dur_s: float = 8.0,
+    ) -> Tuple[Dict, Dict, int]:
+        """
+        从缓存的fbank特征进行ASR推理，支持自适应降级
+
+        Args:
+            cached_fbank: VAD阶段缓存的fbank特征 tensor [T, 80]
+            segment_infos: 片段信息列表 [(start_frame, end_frame, uttid, dur), ...]
+            audio_durs: 原始音频时长列表
+            current_max_dur: 当前子batch最大时长限制（OOM降级时使用）
+            min_dur_s: 最小时长阈值，低于此值将逐个处理
+
+        Returns:
+            (uttid2result, uttid2audio_dur, failed_count)
+        """
+        uttid2result = {}
+        uttid2audio_dur = {}
+        failed_count = 0
+
+        try:
+            batch_asr_results = self.asr.transcribe_from_cached_fbank(
+                cached_fbank, segment_infos
+            )
+            batch_asr_results = [
+                a for a in batch_asr_results if not _BLANK_SIL_PATTERN.search(a["text"])
+            ]
+
+            for res, audio_dur in zip(batch_asr_results, audio_durs):
+                uttid = res["uttid"]
+                if "timestamp" in res:
+                    res["timestamp"] = filter_timestamp_by_duration(
+                        res["timestamp"], audio_dur
+                    )
+                uttid2result[uttid] = res
+                uttid2audio_dur[uttid] = audio_dur
+
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                total_dur = sum(audio_durs)
+                logger.warning(
+                    f"OOM with batch_size={len(segment_infos)}, total_dur={total_dur:.1f}s, falling back..."
+                )
+
+                import gc
+
+                gc.collect()
+                try:
+                    import torch
+
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except ImportError:
+                    pass
+
+                if total_dur <= min_dur_s or len(segment_infos) == 1:
+                    logger.error(
+                        f"Cannot reduce further (total_dur={total_dur:.1f}s <= "
+                        f"min_dur={min_dur_s}s), processing one by one..."
+                    )
+                    for i in range(len(segment_infos)):
+                        try:
+                            single_result = self.asr.transcribe_from_cached_fbank(
+                                cached_fbank, [segment_infos[i]]
+                            )
+                            single_result = [
+                                a
+                                for a in single_result
+                                if not _BLANK_SIL_PATTERN.search(a["text"])
+                            ]
+                            if single_result:
+                                res = single_result[0]
+                                if "timestamp" in res:
+                                    res["timestamp"] = filter_timestamp_by_duration(
+                                        res["timestamp"], audio_durs[i]
+                                    )
+                                uttid2result[segment_infos[i][2]] = res
+                                uttid2audio_dur[segment_infos[i][2]] = audio_durs[i]
+                        except Exception as inner_e:
+                            logger.error(
+                                f"Failed to process single segment {segment_infos[i][2]}: {inner_e}"
+                            )
+                            failed_count += 1
+                    return uttid2result, uttid2audio_dur, failed_count
+
+                target_dur = current_max_dur or (total_dur // 2)
+                target_dur = max(target_dur, min_dur_s)
+                logger.info(f"Retrying with target_dur={target_dur:.1f}s")
+
+                sub_batch_indices = self._subdivide_batch_by_duration(
+                    audio_durs, target_dur
+                )
+
+                for sub_indices in sub_batch_indices:
+                    sub_segment_infos = [segment_infos[i] for i in sub_indices]
+                    sub_audio_durs = [audio_durs[i] for i in sub_indices]
+
+                    sub_result, sub_dur, sub_failed = (
+                        self._transcribe_batch_from_cache_with_fallback(
+                            cached_fbank,
+                            sub_segment_infos,
+                            sub_audio_durs,
+                            current_max_dur=target_dur,
+                            min_dur_s=min_dur_s,
+                        )
+                    )
+
+                    uttid2result.update(sub_result)
+                    uttid2audio_dur.update(sub_dur)
+                    failed_count += sub_failed
+            else:
+                logger.error(f"Non-OOM RuntimeError: {str(e)}", exc_info=True)
+                failed_count = len(segment_infos)
+        except Exception as e:
+            logger.error(f"Unexpected error during ASR: {str(e)}", exc_info=True)
+            failed_count = len(segment_infos)
+
+        return uttid2result, uttid2audio_dur, failed_count
+
     def _process_single_audio(
         self, audio_idx: int, audio_info: Dict, max_batch_dur_s: float
     ) -> AudioProcessResult:
@@ -522,6 +804,7 @@ class MixedASRSystem:
         audio_path = audio_info["audio_path"]
         original_file = audio_info.get("original_file")
         start_time = time.perf_counter()
+        audio_data = None
 
         try:
             logger.info(f"[{audio_idx}] 开始处理音频: {audio_path}")
@@ -530,7 +813,17 @@ class MixedASRSystem:
             dur_s = audio_data.shape[0] / SAMPLE_RATE
             logger.debug(f"[{audio_idx}] 音频加载完成，时长: {dur_s:.2f}s")
 
-            vad_result, _ = self.vad.detect((SAMPLE_RATE, audio_data))
+            vad_result, probs, cached_fbank = self.vad.detect(
+                (SAMPLE_RATE, audio_data), return_fbank_cache=True
+            )
+            del probs
+            logger.debug(
+                f"[{audio_idx}] VAD fbank缓存已启用，shape: {cached_fbank.shape if cached_fbank is not None else 'None'}"
+            )
+
+            del audio_data
+            audio_data = None
+            gc.collect()
 
             if vad_result is None:
                 logger.warning(f"[{audio_idx}] VAD 结果为空，跳过")
@@ -564,7 +857,7 @@ class MixedASRSystem:
                     error_msg="No valid VAD segments",
                 )
 
-            batches = self.split_vad_to_batches(
+            batches = self.batch_vad_segments(
                 audio_segments, max_batch_dur_s=max_batch_dur_s, use_bfd=self.use_bfd
             )
             logger.info(f"[{audio_idx}] 分批完成，共 {len(batches)} 个 batch")
@@ -574,41 +867,43 @@ class MixedASRSystem:
 
             logger.info(f"[{audio_idx}] 开始 ASR 推理，共 {len(batches)} 个 batch")
 
+            FRAME_SHIFT_S = 0.010
+
             for batch_idx, seg_indices in enumerate(batches):
                 try:
                     batch_segs = [audio_segments[i] for i in seg_indices]
 
-                    batch_uttids = []
-                    batch_wavs = []
+                    segment_infos = []
                     batch_audio_durs = []
 
                     for seg in batch_segs:
-                        start_sample = round(seg.start_s * SAMPLE_RATE)
-                        end_sample = round(seg.end_s * SAMPLE_RATE)
-                        wav_segment = audio_data[start_sample:end_sample]
+                        start_frame = int(seg.start_s / FRAME_SHIFT_S)
+                        end_frame = int(seg.end_s / FRAME_SHIFT_S)
+                        dur = seg.end_s - seg.start_s
 
-                        original_audio_dur = seg.end_s - seg.start_s
-
-                        batch_uttids.append(seg.uttid)
-                        batch_wavs.append((SAMPLE_RATE, wav_segment))
-                        batch_audio_durs.append(original_audio_dur)
+                        segment_infos.append((start_frame, end_frame, seg.uttid, dur))
+                        batch_audio_durs.append(dur)
 
                     logger.debug(
-                        f"[{audio_idx}] ASR batch {batch_idx+1}/{len(batches)}: {len(batch_wavs)} segments"
+                        f"[{audio_idx}] ASR batch {batch_idx+1}/{len(batches)}: {len(segment_infos)} segments"
                     )
 
-                    result, audio_dur, failed = (
-                        self._process_batch_with_adaptive_fallback(
-                            batch_uttids, batch_wavs, batch_audio_durs
-                        )
+                    result, _, failed = self._transcribe_batch_from_cache_with_fallback(
+                        cached_fbank, segment_infos, batch_audio_durs
                     )
 
                     uttid2asr_result.update(result)
                     failed_batches += failed
 
                     logger.info(
-                        f"[{audio_idx}] ASR batch {batch_idx+1}/{len(batches)} 完成，{len(batch_wavs)} 个片段"
+                        f"[{audio_idx}] ASR batch {batch_idx+1}/{len(batches)} 完成，{len(segment_infos)} 个片段"
                     )
+
+                    del segment_infos
+                    del batch_audio_durs
+                    del batch_segs
+
+                    gc.collect()
 
                 except Exception as e:
                     logger.error(
@@ -616,6 +911,10 @@ class MixedASRSystem:
                         exc_info=True,
                     )
                     failed_batches += 1
+
+            del cached_fbank
+            cached_fbank = None
+            self._cleanup_resources()
 
             logger.info(
                 f"[{audio_idx}] ASR 完成，成功 {len(uttid2asr_result)} 个片段，失败 {failed_batches} 个片段"
@@ -659,9 +958,12 @@ class MixedASRSystem:
 
             if self.punc and sentences:
                 logger.info(f"[{audio_idx}] 开始添加标点...")
+                punc_error = None
+
                 try:
                     if words:
                         batch_timestamp = []
+                        expected_punc_count = 0
                         for seg in audio_segments:
                             if seg.uttid not in uttid2asr_result:
                                 continue
@@ -672,64 +974,109 @@ class MixedASRSystem:
                                 for w, s, e in asr_res["timestamp"]:
                                     timestamp_list.append((w, s, e))
                                 batch_timestamp.append(timestamp_list)
-                        
+                                expected_punc_count += 1
+
                         if batch_timestamp:
-                            punc_results = self.punc.process_with_timestamp(batch_timestamp)
-                            
-                            new_sentences = []
-                            punc_idx = 0
-                            for seg in audio_segments:
-                                if seg.uttid not in uttid2asr_result:
-                                    continue
-                                asr_res = uttid2asr_result[seg.uttid]
-                                if "timestamp" not in asr_res or not asr_res["timestamp"]:
-                                    continue
-                                
-                                seg_start_ms = round(seg.start_s * 1000)
-                                seg_end_ms = round(seg.end_s * 1000)
-                                
-                                if punc_idx < len(punc_results):
-                                    punc_result = punc_results[punc_idx]
-                                    punc_sentences = punc_result.get("punc_sentences", [])
-                                    
-                                    for i, punc_sent in enumerate(punc_sentences):
-                                        punc_text = punc_sent["punc_text"]
-                                        punc_start_s = punc_sent["start_s"]
-                                        punc_end_s = punc_sent["end_s"]
-                                        
-                                        new_start_ms = round(punc_start_s * 1000 + seg_start_ms)
-                                        new_end_ms = round(punc_end_s * 1000 + seg_start_ms)
-                                        
-                                        if i == 0:
-                                            new_start_ms = seg_start_ms
-                                        if i == len(punc_sentences) - 1:
-                                            new_end_ms = seg_end_ms
-                                        
-                                        new_sentences.append({
-                                            "start_ms": new_start_ms,
-                                            "end_ms": new_end_ms,
-                                            "text": punc_text,
-                                            "asr_confidence": asr_res.get("confidence", 0.0),
-                                        })
-                                    punc_idx += 1
-                            
-                            if new_sentences:
-                                sentences = new_sentences
-                                full_text = "".join(s["text"] for s in sentences)
+                            PUNC_BATCH_SIZE = 10
+                            all_punc_results = []
+                            for i in range(0, len(batch_timestamp), PUNC_BATCH_SIZE):
+                                batch_chunk = batch_timestamp[i : i + PUNC_BATCH_SIZE]
+                                chunk_results = self.punc.process_with_timestamp(
+                                    batch_chunk
+                                )
+                                all_punc_results.extend(chunk_results)
+                                del chunk_results
+                            punc_results = all_punc_results
+
+                            if len(punc_results) != expected_punc_count:
+                                punc_error = f"Punc结果数量({len(punc_results)})与预期({expected_punc_count})不匹配"
+                                logger.warning(
+                                    f"[{audio_idx}] {punc_error}，保留原始文本"
+                                )
+                            else:
+                                new_sentences = []
+                                punc_idx = 0
+                                for seg in audio_segments:
+                                    if seg.uttid not in uttid2asr_result:
+                                        continue
+                                    asr_res = uttid2asr_result[seg.uttid]
+                                    if (
+                                        "timestamp" not in asr_res
+                                        or not asr_res["timestamp"]
+                                    ):
+                                        continue
+
+                                    seg_start_ms = round(seg.start_s * 1000)
+                                    seg_end_ms = round(seg.end_s * 1000)
+
+                                    if punc_idx < len(punc_results):
+                                        punc_result = punc_results[punc_idx]
+                                        punc_sentences = punc_result.get(
+                                            "punc_sentences", []
+                                        )
+
+                                        for i, punc_sent in enumerate(punc_sentences):
+                                            punc_text = punc_sent["punc_text"]
+                                            punc_start_s = punc_sent["start_s"]
+                                            punc_end_s = punc_sent["end_s"]
+
+                                            new_start_ms = round(
+                                                punc_start_s * 1000 + seg_start_ms
+                                            )
+                                            new_end_ms = round(
+                                                punc_end_s * 1000 + seg_start_ms
+                                            )
+
+                                            if i == 0:
+                                                new_start_ms = seg_start_ms
+                                            if i == len(punc_sentences) - 1:
+                                                new_end_ms = seg_end_ms
+
+                                            new_sentences.append(
+                                                {
+                                                    "start_ms": new_start_ms,
+                                                    "end_ms": new_end_ms,
+                                                    "text": punc_text,
+                                                    "asr_confidence": asr_res.get(
+                                                        "confidence", 0.0
+                                                    ),
+                                                }
+                                            )
+                                        punc_idx += 1
+
+                                if new_sentences:
+                                    sentences = new_sentences
+                                    full_text = "".join(s["text"] for s in sentences)
                     else:
                         batch_text = [s["text"] for s in sentences]
-                        punc_results = self.punc.process(batch_text)
-                        
-                        for i, punc_res in enumerate(punc_results):
-                            sentences[i]["text"] = punc_res["punc_text"]
-                        
-                        full_text = "".join(s["text"] for s in sentences)
-                    
-                    logger.info(f"[{audio_idx}] 标点添加完成")
-                except Exception as e:
-                    logger.warning(f"[{audio_idx}] 标点添加失败: {str(e)}，使用原始文本")
+                        PUNC_BATCH_SIZE = 50
+                        all_punc_results = []
+                        for i in range(0, len(batch_text), PUNC_BATCH_SIZE):
+                            batch_chunk = batch_text[i : i + PUNC_BATCH_SIZE]
+                            chunk_results = self.punc.process(batch_chunk)
+                            all_punc_results.extend(chunk_results)
+                            del chunk_results
+                        punc_results = all_punc_results
 
-            full_text = re.sub(r'([.,!?])\s*([a-zA-Z])', r'\1 \2', full_text)
+                        if len(punc_results) != len(sentences):
+                            punc_error = f"Punc结果数量({len(punc_results)})与句子数量({len(sentences)})不匹配"
+                            logger.warning(f"[{audio_idx}] {punc_error}，保留原始文本")
+                        else:
+                            for i, punc_res in enumerate(punc_results):
+                                sentences[i]["text"] = punc_res["punc_text"]
+                            full_text = "".join(s["text"] for s in sentences)
+
+                except Exception as e:
+                    punc_error = str(e)
+                    logger.warning(
+                        f"[{audio_idx}] 标点添加失败: {punc_error}，使用原始文本",
+                        exc_info=True,
+                    )
+
+                if punc_error is None:
+                    logger.info(f"[{audio_idx}] 标点添加完成")
+
+            full_text = re.sub(r"([.,!?])\s*([a-zA-Z])", r"\1 \2", full_text)
 
             result = {
                 "uttid": os.path.basename(audio_path).split(".")[0],
@@ -770,22 +1117,40 @@ class MixedASRSystem:
                 success=False,
                 error_msg=error_msg,
             )
+        finally:
+            if audio_data is not None:
+                del audio_data
+            if "cached_fbank" in locals() and cached_fbank is not None:
+                del cached_fbank
+            force_cache = self._check_memory_pressure()
+            self._cleanup_resources(force_cuda_cache=force_cache)
 
-    def batch_process(self, audio_files: List[Dict], max_batch_dur_s=64):
+    def batch_process(
+        self,
+        audio_files: List[Dict],
+        max_batch_dur_s: int = 64,
+        on_result_callback=None,
+    ):
         """
-        逐个处理音频文件
+        逐个处理音频文件，支持流式回调
 
         Args:
             audio_files: 音频文件信息列表
             max_batch_dur_s: ASR batch 最大时长
+            on_result_callback: 处理完成回调函数，签名: (audio_idx, result, error_msg) -> None
+                                result 为 AudioProcessResult 对象
 
         Returns:
-            (final_results, stats): 处理结果列表和统计信息
+            stats: 统计信息（流式累加，不存储中间结果）
         """
         if not audio_files:
-            return [], {}
+            return {}
 
-        process_results: List[AudioProcessResult] = []
+        total_audio_dur = 0.0
+        total_processing_time = 0.0
+        rtfs = []
+        success_count = 0
+        error_count = 0
 
         for audio_idx, audio_info in enumerate(audio_files):
             result = self._process_single_audio(
@@ -793,25 +1158,22 @@ class MixedASRSystem:
                 audio_info=audio_info,
                 max_batch_dur_s=max_batch_dur_s,
             )
-            process_results.append(result)
 
-        final_results = []
-        rtfs = []
-        total_audio_dur = 0.0
-        total_processing_time = 0.0
-        success_count = 0
-        error_count = 0
-
-        for pr in process_results:
-            if pr.success and pr.result:
-                final_results.append(pr.result)
-                rtfs.append(pr.rtf)
-                total_audio_dur += pr.result["dur_s"]
-                total_processing_time += pr.processing_time_s
+            if result.success and result.result:
                 success_count += 1
+                rtfs.append(result.rtf)
+                total_audio_dur += result.result["dur_s"]
+                total_processing_time += result.processing_time_s
             else:
                 error_count += 1
-                logger.warning(f"音频 {pr.audio_path} 处理失败: {pr.error_msg}")
+                logger.warning(f"音频 {result.audio_path} 处理失败: {result.error_msg}")
+
+            if on_result_callback:
+                on_result_callback(audio_idx, result, len(audio_files))
+
+            if result.result:
+                result.result.clear()
+            del result
 
         avg_rtf = sum(rtfs) / len(rtfs) if rtfs else 0.0
         overall_rtf = (
@@ -828,4 +1190,4 @@ class MixedASRSystem:
             "per_audio_rtfs": rtfs,
         }
 
-        return final_results, stats
+        return stats

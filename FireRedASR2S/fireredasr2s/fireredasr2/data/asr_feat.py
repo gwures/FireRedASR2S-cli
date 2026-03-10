@@ -4,18 +4,19 @@ import math
 import os
 from typing import List
 
-import kaldi_native_fbank as knf
 import kaldiio
 import numpy as np
 import torch
 import torch.nn.utils.rnn as rnn_utils
+import torchaudio.compliance.kaldi as kaldi
 
 
 class ASRFeatExtractor:
     def __init__(self, kaldi_cmvn_file):
         self.cmvn = CMVN(kaldi_cmvn_file) if kaldi_cmvn_file != "" else None
-        self.fbank = KaldifeatFbank(num_mel_bins=80, frame_length=25,
-            frame_shift=10, dither=0.0)
+        self.fbank = KaldifeatFbank(
+            num_mel_bins=80, frame_length=25, frame_shift=10, dither=0.0
+        )
 
     def __call__(self, wav_paths, wav_uttids):
         feats = []
@@ -27,6 +28,8 @@ class ASRFeatExtractor:
         if isinstance(wav_paths[0], str):
             for wav_path in wav_paths:
                 sample_rate, wav_np = kaldiio.load_mat(wav_path)
+                if wav_np.dtype != np.float32:
+                    wav_np = wav_np.astype(np.float32)
                 wav_datas.append([sample_rate, wav_np])
         else:
             wav_datas = wav_paths
@@ -38,7 +41,6 @@ class ASRFeatExtractor:
                 continue
             if self.cmvn is not None:
                 fbank = self.cmvn(fbank)
-            fbank = torch.from_numpy(fbank)
             feats.append(fbank)
             durs.append(dur)
             return_wav_paths.append(path)
@@ -50,24 +52,47 @@ class ASRFeatExtractor:
             lengths, feats_pad = None, None
         return feats_pad, lengths, durs, return_wav_paths, return_wav_uttids
 
-    def pad_feat(self, xs: List[torch.Tensor], pad_value: float) -> torch.Tensor:
+    def extract_from_cached_fbank(self, cached_fbank, segment_infos):
         """
-        使用 pad_sequence 进行特征 padding，支持更高效的内存布局
-        
+        从缓存的 fbank 中提取片段特征，避免重复计算
+
         Args:
-            xs: 特征列表，每个元素形状为 (frames, dim)
-            pad_value: padding 填充值
-            
+            cached_fbank: VAD 阶段缓存的原始 fbank tensor, shape [T, 80]
+            segment_infos: List of (start_frame, end_frame, uttid, dur) tuples
+
         Returns:
-            padded: padding 后的张量，形状为 (batch, max_frames, dim)
+            feats_pad, lengths, durs, uttids
         """
+        feats = []
+        durs = []
+        uttids = []
+
+        for start_frame, end_frame, uttid, dur in segment_infos:
+            seg_fbank = cached_fbank[start_frame:end_frame].clone()
+            if seg_fbank.shape[0] < 1:
+                continue
+            if self.cmvn is not None:
+                seg_fbank = self.cmvn(seg_fbank)
+            feats.append(seg_fbank)
+            durs.append(dur)
+            uttids.append(uttid)
+
+        if len(feats) > 0:
+            lengths = torch.tensor([feat.size(0) for feat in feats]).long()
+            feats_pad = self.pad_feat(feats, 0.0)
+        else:
+            lengths, feats_pad = None, None
+        return feats_pad, lengths, durs, uttids
+
+    def pad_feat(self, xs: List[torch.Tensor], pad_value: float) -> torch.Tensor:
         return rnn_utils.pad_sequence(xs, batch_first=True, padding_value=pad_value)
 
 
 class CMVN:
     def __init__(self, kaldi_cmvn_file):
-        self.dim, self.means, self.inverse_std_variences = \
-            self.read_kaldi_cmvn(kaldi_cmvn_file)
+        self.dim, self.means, self.inverse_std_variences = self.read_kaldi_cmvn(
+            kaldi_cmvn_file
+        )
 
     def __call__(self, x, is_train=False):
         assert x.shape[-1] == self.dim, "CMVN dim mismatch"
@@ -88,43 +113,44 @@ class CMVN:
         for d in range(dim):
             mean = stats[0, d] / count
             means.append(mean.item())
-            varience = (stats[1, d] / count) - mean*mean
+            varience = (stats[1, d] / count) - mean * mean
             if varience < floor:
                 varience = floor
             istd = 1.0 / math.sqrt(varience)
             inverse_std_variences.append(istd)
-        return dim, np.array(means, dtype=np.float32), np.array(inverse_std_variences, dtype=np.float32)
-
+        return (
+            dim,
+            torch.tensor(means, dtype=torch.float32),
+            torch.tensor(inverse_std_variences, dtype=torch.float32),
+        )
 
 
 class KaldifeatFbank:
-    def __init__(self, num_mel_bins=80, frame_length=25, frame_shift=10,
-                 dither=1.0):
+    def __init__(self, num_mel_bins=80, frame_length=25, frame_shift=10, dither=1.0):
+        self.num_mel_bins = num_mel_bins
+        self.frame_length = frame_length
+        self.frame_shift = frame_shift
         self.dither = dither
-        opts = knf.FbankOptions()
-        opts.frame_opts.dither = dither
-        opts.mel_opts.num_bins = num_mel_bins
-        opts.frame_opts.snip_edges = True
-        opts.mel_opts.debug_mel = False
-        self.opts = opts
+        self.snip_edges = True
 
     def __call__(self, wav, is_train=False):
         if type(wav) is str:
             sample_rate, wav_np = kaldiio.load_mat(wav)
+            if wav_np.dtype != np.float32:
+                wav_np = wav_np.astype(np.float32)
         elif type(wav) in [tuple, list] and len(wav) == 2:
             sample_rate, wav_np = wav
         assert len(wav_np.shape) == 1
 
         dither = self.dither if is_train else 0.0
-        self.opts.frame_opts.dither = dither
-        fbank = knf.OnlineFbank(self.opts)
-
-        fbank.accept_waveform(sample_rate, wav_np)
-        num_frames = fbank.num_frames_ready
-        if num_frames == 0:
-            print("Check data, len(feat) == 0", wav, flush=True)
-            return np.zeros((0, self.opts.mel_opts.num_bins), dtype=np.float32)
-        feat = np.empty((num_frames, self.opts.mel_opts.num_bins), dtype=np.float32)
-        for i in range(num_frames):
-            feat[i] = fbank.get_frame(i)
+        wav_tensor = torch.from_numpy(wav_np).unsqueeze(0)
+        feat = kaldi.fbank(
+            wav_tensor,
+            num_mel_bins=self.num_mel_bins,
+            frame_length=self.frame_length,
+            frame_shift=self.frame_shift,
+            dither=dither,
+            snip_edges=self.snip_edges,
+            sample_frequency=16000,
+        )
         return feat

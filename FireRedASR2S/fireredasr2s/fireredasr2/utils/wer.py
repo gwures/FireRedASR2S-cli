@@ -8,12 +8,12 @@ from collections import OrderedDict
 
 _UNK_PATTERN = re.compile(r"<unk>")
 _TAG_PATTERN = re.compile(r"<.*>")
-_CJK_PATTERN = re.compile(r'([\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\u31f0-\u31ff])')
+_CJK_PATTERN = re.compile(r"([\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\u31f0-\u31ff])")
 _ABBR_LONG_PATTERN = re.compile(r"(?<![a-zA-Z'])([a-zA-Z] ){5,}[a-zA-Z](?![a-zA-Z'])")
 _ABBR_FIX_PATTERN = re.compile(r"(?<![a-zA-Z'])([a-zA-Z]) (?=[a-zA-Z](?![a-zA-Z']))")
 _EN_PATTERN = re.compile(r"[a-zA-Z\.\-\']+")
 _DIG_PATTERN = re.compile(r"[0-9]+")
-_CJK_CHAR_PATTERN = re.compile(r'([\u4e00-\u9fff])')
+_CJK_CHAR_PATTERN = re.compile(r"([\u4e00-\u9fff])")
 _SPECIAL_TAG_PATTERN = re.compile(r"<\|.*?\|>")
 
 parser = argparse.ArgumentParser()
@@ -28,7 +28,8 @@ def main(args):
     uttid2refs = read_uttid2tokens(args.ref, args.do_tn, args.rm_special)
     uttid2hyps = read_uttid2tokens(args.hyp, args.do_tn, args.rm_special)
     uttid2wer_info, wer_stat, en_dig_stat = compute_uttid2wer_info(
-        uttid2refs, uttid2hyps, args.print_sentence_wer)
+        uttid2refs, uttid2hyps, args.print_sentence_wer
+    )
     wer_stat.print()
     en_dig_stat.print()
 
@@ -57,16 +58,22 @@ def read_uttid2text(filename, do_tn=False, rm_special=False):
                 continue
             txt = " ".join(cols[1:])
             if rm_special:
-                txt = " ".join([t for t in _SPECIAL_TAG_PATTERN.split(txt) if t.strip() != ""])
+                txt = " ".join(
+                    [t for t in _SPECIAL_TAG_PATTERN.split(txt) if t.strip() != ""]
+                )
             if do_tn:
                 import cn2an
+
                 txt = cn2an.transform(txt, "an2cn")
             uttid2text[cols[0]] = txt
     return uttid2text
 
 
 def text2tokens(text):
-    PUNCTUATIONS = "，。？！,\.?!＂＃＄％＆＇（）＊＋－／：；＜＝＞＠［＼］＾＿｀｛｜｝～｟｠｢｣､　、〃〈〉《》「」『』【】〔〕〖〗〘〙〚〛〜〝〞〟〰〾〿–—‘’‛“”„‟…‧﹏﹑﹔·｡\":" + "()\[\]{}/;`|=+"
+    PUNCTUATIONS = (
+        "，。？！,\\.?!＂＃＄％＆＇（）＊＋－／：；＜＝＞＠［＼］＾＿｀｛｜｝～｟｠｢｣､　、〃〈〉《》「」『』【】〔〕〖〗〘〙〚〛〜〝〞〟〰〾〿–—''‛"
+        "„‟…‧﹏﹑﹔·｡\\" + r"()\[\]{}/;`|=+"
+    )
     if text == "":
         return []
     tokens = []
@@ -90,17 +97,15 @@ def fix_abbr_simple(text):
     ori_text = text
     if _ABBR_LONG_PATTERN.search(text):
         return text
-    
+
     prev = None
     while prev != text:
         prev = text
-        text = _ABBR_FIX_PATTERN.sub(r'\1', text)
-    
+        text = _ABBR_FIX_PATTERN.sub(r"\1", text)
+
     if ori_text != text:
         print(f"WER FIX: '{ori_text}' --> '{text}'")
     return text
-
-
 
 
 def compute_uttid2wer_info(refs, hyps, print_sentence_wer=False):
@@ -117,8 +122,10 @@ def compute_uttid2wer_info(refs, hyps, print_sentence_wer=False):
         hyp = hyps[uttid]
 
         if len(hyp) - len(ref) >= 8:
-            print(f"[BidLengthDiff]: {uttid} {len(ref)} {len(hyp)}#{' '.join(ref)}#{' '.join(hyp)}")
-            #continue
+            print(
+                f"[BidLengthDiff]: {uttid} {len(ref)} {len(hyp)}#{' '.join(ref)}#{' '.join(hyp)}"
+            )
+            # continue
 
         wer_info = compute_one_wer_info(ref, hyp)
         uttid2wer_info[uttid] = wer_info
@@ -165,7 +172,7 @@ def compute_one_wer_info(ref, hyp):
 
     # Initialize
     for i in range(1, hyp_len + 1):
-        dp[0][i].cost = dp[0][i - 1].cost + COST_INS;
+        dp[0][i].cost = dp[0][i - 1].cost + COST_INS
         dp[0][i].align = ALIGN_INS
     for i in range(1, ref_len + 1):
         dp[i][0].cost = dp[i - 1][0].cost + COST_DEL
@@ -227,7 +234,6 @@ def compute_one_wer_info(ref, hyp):
     return wer_info
 
 
-
 class WerInfo:
     def __init__(self, ref, err, crt, sub, dele, ins, ali):
         self.r = ref
@@ -267,11 +273,11 @@ class WerStats:
         sen = max(len(self.infos), 1)
         errsen = sum(info.e > 0 for info in self.infos)
         ser = 100.0 * errsen / sen
-        print("-"*80)
+        print("-" * 80)
         print(f"ref{r:6d} sub{s:6d} del{d:6d} ins{i:6d}")
         print(f"WER{wer:6.2f} sub{se:6.2f} del{de:6.2f} ins{ie:6.2f}")
         print(f"SER{ser:6.2f} = {errsen} / {sen}")
-        print("-"*80)
+        print("-" * 80)
 
 
 class EnDigStats:
@@ -288,10 +294,11 @@ class EnDigStats:
         self.n_dig_correct += n_dig_correct
 
     def print(self):
-        print(f"English #word={self.n_en_word}, #correct={self.n_en_correct}\n"
-              f"Digit #word={self.n_dig_word}, #correct={self.n_dig_correct}")
-        print("-"*80)
-
+        print(
+            f"English #word={self.n_en_word}, #correct={self.n_en_correct}\n"
+            f"Digit #word={self.n_dig_word}, #correct={self.n_dig_correct}"
+        )
+        print("-" * 80)
 
 
 def count_english_ditgit(ref, hyp, wer_info):
@@ -304,22 +311,24 @@ def count_english_ditgit(ref, hyp, wer_info):
         if _EN_PATTERN.match(token):
             n_en_word += 1
             for y in ali:
-                if y[0] == i+1 and y[2] == ALIGN_CRT:
+                if y[0] == i + 1 and y[2] == ALIGN_CRT:
                     j = y[1] - 1
                     n_en_correct += 1
                     break
         if _DIG_PATTERN.match(token):
             n_dig_word += 1
             for y in ali:
-                if y[0] == i+1 and y[2] == ALIGN_CRT:
+                if y[0] == i + 1 and y[2] == ALIGN_CRT:
                     j = y[1] - 1
                     n_dig_correct += 1
                     break
-        if not _CJK_CHAR_PATTERN.match(token) and not _EN_PATTERN.match(token) \
-           and not _DIG_PATTERN.match(token):
+        if (
+            not _CJK_CHAR_PATTERN.match(token)
+            and not _EN_PATTERN.match(token)
+            and not _DIG_PATTERN.match(token)
+        ):
             print("[WiredChar]:", token)
     return n_en_word, n_en_correct, n_dig_word, n_dig_correct
-
 
 
 if __name__ == "__main__":

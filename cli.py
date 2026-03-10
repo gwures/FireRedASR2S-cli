@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 
+import os
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import argparse
 import logging
-import os
 import re
 import sys
 import warnings
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 warnings.filterwarnings(
     "ignore", category=DeprecationWarning, message="pkg_resources is deprecated"
@@ -24,8 +27,8 @@ os.environ["PYTHONPATH"] = (
 )
 
 import config
-from core.worker import MixedASRSystem
-from services import FileService, SUPPORTED_AUDIO_EXTENSIONS, collect_audio_files, validate_file
+from core.worker import get_or_create_asr_system
+from services import FileService, collect_audio_files, validate_file
 
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
@@ -43,7 +46,7 @@ root_logger.addHandler(stream_handler)
 
 logger = logging.getLogger("fireredasr2s.cli")
 
-_SRT_PUNC_PATTERN = re.compile(r'[][，。！？、；：""''（）【】《》,.!?;:\'"()<>]')
+_SRT_PUNC_PATTERN = re.compile(r'[][，。！？、；：""' "（）【】《》,.!?;:'\"()<>]")
 
 
 def format_srt_time(ms: int) -> str:
@@ -159,6 +162,67 @@ def collect_files(args) -> List[Path]:
     )
 
 
+def _write_result_files(
+    result: dict, unified_output_dir: Optional[Path] = None
+) -> dict:
+    """
+    将单个处理结果写入文件
+
+    Args:
+        result: ASR 处理结果
+        unified_output_dir: 统一输出目录（可选）
+
+    Returns:
+        输出文件信息字典
+    """
+    original_file = result.get("original_file", None)
+    if original_file is None:
+        original_file = Path(result["wav_path"])
+    else:
+        original_file = Path(original_file)
+
+    task_id = original_file.stem
+    audio_dur = result.get("dur_s", 0)
+
+    if unified_output_dir:
+        file_output_dir = unified_output_dir
+    else:
+        file_output_dir = original_file.parent
+
+    output_srt = file_output_dir / f"{task_id}.srt"
+    output_txt = file_output_dir / f"{task_id}.txt"
+
+    srt_index = 1
+    with open(output_srt, "w", encoding="utf-8") as f:
+        for sentence in result.get("sentences", []):
+            start_ms = sentence.get("start_ms", 0)
+            end_ms = sentence.get("end_ms", 0)
+            text = sentence.get("text", "")
+
+            srt_text = _SRT_PUNC_PATTERN.sub("", text)
+            if not srt_text.strip():
+                continue
+
+            start_time_srt = format_srt_time(start_ms)
+            end_time_srt = format_srt_time(end_ms)
+
+            f.write(f"{srt_index}\n")
+            f.write(f"{start_time_srt} --> {end_time_srt}\n")
+            f.write(f"{srt_text}\n\n")
+            srt_index += 1
+
+    with open(output_txt, "w", encoding="utf-8") as f:
+        f.write(result.get("text", ""))
+
+    return {
+        "original_file": original_file,
+        "output_txt": output_txt,
+        "text": result.get("text", ""),
+        "file_output_dir": file_output_dir,
+        "audio_dur": audio_dur,
+    }
+
+
 def process_files(files: List[Path], args):
     if args.nfp:
         use_fp16 = False
@@ -206,6 +270,25 @@ def process_files(files: List[Path], args):
     }
 
     wav_files_to_cleanup = []
+    conversion_failed_count = 0
+
+    def on_result_callback(audio_idx: int, process_result, total_count: int):
+        """处理单个结果的回调函数"""
+        if process_result.success and process_result.result:
+            output_info = _write_result_files(process_result.result, unified_output_dir)
+            original_file = output_info["original_file"]
+            audio_dur = output_info["audio_dur"]
+            file_output_dir = output_info["file_output_dir"]
+
+            output_dir_str = str(file_output_dir)
+            logger.info(
+                f"[{audio_idx + 1}/{total_count}] 完成: {original_file.name} "
+                f"(音频: {audio_dur:.2f}s) -> {output_dir_str}"
+            )
+        else:
+            logger.warning(
+                f"[{audio_idx + 1}/{total_count}] 失败: {process_result.audio_path} - {process_result.error_msg}"
+            )
 
     with FileService(str(config.TEMP_DIR), str(config.TEMP_DIR)) as file_service:
         try:
@@ -214,91 +297,37 @@ def process_files(files: List[Path], args):
             results = file_service.convert([str(f) for f in valid_files])
 
             audio_files = []
-            conversion_failed_count = 0
             for result in results:
                 if result.success:
                     wav_files_to_cleanup.append(Path(result.output_path))
-                    audio_files.append({
-                        "audio_path": result.output_path,
-                        "original_file": Path(result.input_path)
-                    })
+                    audio_files.append(
+                        {
+                            "audio_path": result.output_path,
+                            "original_file": Path(result.input_path),
+                        }
+                    )
                 else:
                     conversion_failed_count += 1
-                    logger.warning(f"转换失败 {result.input_path}: {result.error_message}")
+                    logger.warning(
+                        f"转换失败 {result.input_path}: {result.error_message}"
+                    )
 
             if not audio_files:
                 logger.error("没有任务被创建")
                 return
 
             logger.info("初始化 ASR 系统...")
-            asr_system = MixedASRSystem(worker_config)
+            asr_system = get_or_create_asr_system(worker_config)
 
             logger.info(f"开始批量处理 {len(audio_files)} 个文件...")
-            final_results, perf_stats = asr_system.batch_process(
-                audio_files, max_batch_dur_s=max_batch_dur_s
+            perf_stats = asr_system.batch_process(
+                audio_files,
+                max_batch_dur_s=max_batch_dur_s,
+                on_result_callback=on_result_callback,
             )
 
-            completed_count = perf_stats.get("success_count", len(final_results))
+            completed_count = perf_stats.get("success_count", 0)
             failed_count = perf_stats.get("error_count", 0) + conversion_failed_count
-            output_files_info = []
-
-            for i, result in enumerate(final_results):
-                original_file = result.get("original_file", None)
-                if original_file is None:
-                    original_file = Path(result["wav_path"])
-                else:
-                    original_file = Path(original_file)
-
-                task_id = original_file.stem
-                audio_dur = result.get("dur_s", 0)
-
-                if unified_output_dir:
-                    file_output_dir = unified_output_dir
-                else:
-                    file_output_dir = original_file.parent
-
-                output_srt = file_output_dir / f"{task_id}.srt"
-                output_txt = file_output_dir / f"{task_id}.txt"
-
-                srt_index = 1
-                with open(output_srt, "w", encoding="utf-8") as f:
-                    for sentence in result.get("sentences", []):
-                        start_ms = sentence.get("start_ms", 0)
-                        end_ms = sentence.get("end_ms", 0)
-                        text = sentence.get("text", "")
-
-                        srt_text = _SRT_PUNC_PATTERN.sub('', text)
-                        if not srt_text.strip():
-                            continue
-
-                        start_time_srt = format_srt_time(start_ms)
-                        end_time_srt = format_srt_time(end_ms)
-
-                        f.write(f"{srt_index}\n")
-                        f.write(f"{start_time_srt} --> {end_time_srt}\n")
-                        f.write(f"{srt_text}\n\n")
-                        srt_index += 1
-
-                with open(output_txt, "w", encoding="utf-8") as f:
-                    f.write(result.get("text", ""))
-
-                output_files_info.append(
-                    {
-                        "original_file": original_file,
-                        "output_txt": output_txt,
-                        "text": result.get("text", ""),
-                        "file_output_dir": file_output_dir,
-                        "audio_dur": audio_dur,
-                    }
-                )
-
-                output_info = (
-                    str(file_output_dir) if not unified_output_dir else str(file_output_dir)
-                )
-                logger.info(
-                    f"[{i+1}/{len(final_results)}] 完成: {original_file.name} "
-                    f"(音频: {audio_dur:.2f}s) -> {output_info}"
-                )
 
             logger.info("=" * 60)
             logger.info(f"处理完成! 成功: {completed_count}, 失败: {failed_count}")

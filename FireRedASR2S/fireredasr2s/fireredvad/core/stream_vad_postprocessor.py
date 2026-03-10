@@ -14,7 +14,7 @@ class StreamVadFrameResult:
     is_speech_start: bool = False
     is_speech_end: bool = False
     speech_start_frame: int = -1  # 1-based
-    speech_end_frame: int = -1    # 1-based
+    speech_end_frame: int = -1  # 1-based
 
 
 @enum.unique
@@ -26,13 +26,15 @@ class VadState(enum.Enum):
 
 
 class StreamVadPostprocessor:
-    def __init__(self,
-                 smooth_window_size,
-                 speech_threshold,
-                 pad_start_frame,
-                 min_speech_frame,
-                 max_speech_frame,
-                 min_silence_frame):
+    def __init__(
+        self,
+        smooth_window_size,
+        speech_threshold,
+        pad_start_frame,
+        min_speech_frame,
+        max_speech_frame,
+        min_silence_frame,
+    ):
         self.smooth_window_size = max(1, smooth_window_size)
         self.speech_threshold = speech_threshold
         self.pad_start_frame = max(self.smooth_window_size, pad_start_frame)
@@ -64,10 +66,10 @@ class StreamVadPostprocessor:
         is_speech = self.apply_threshold(smoothed_prob)
 
         result = StreamVadFrameResult(
-            frame_idx = self.frame_cnt,
+            frame_idx=self.frame_cnt,
             is_speech=is_speech,
             raw_prob=round(raw_prob, 3),
-            smoothed_prob=round(smoothed_prob, 3)
+            smoothed_prob=round(smoothed_prob, 3),
         )
 
         result = self.state_transition(is_speech, result)
@@ -109,9 +111,11 @@ class StreamVadPostprocessor:
                 if self.speech_cnt >= self.min_speech_frame:
                     self.state = VadState.SPEECH
                     result.is_speech_start = True
-                    result.speech_start_frame = max(1,
+                    result.speech_start_frame = max(
+                        1,
                         self.frame_cnt - self.speech_cnt + 1 - self.pad_start_frame,
-                        self.last_speech_end_frame + 1)
+                        self.last_speech_end_frame + 1,
+                    )
                     self.last_speech_start_frame = result.speech_start_frame
                     self.silence_cnt = 0
             else:

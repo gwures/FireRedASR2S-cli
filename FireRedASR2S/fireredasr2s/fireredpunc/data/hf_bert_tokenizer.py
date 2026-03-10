@@ -8,6 +8,9 @@ from transformers import BertTokenizer
 
 logger = logging.getLogger(__name__)
 
+_RE_PURE_CN = re.compile(r"^[^a-zA-Z0-9']+$")
+_RE_BERT_PREFIX = re.compile(r"^##")
+
 
 class HfBertTokenizer:
     def __init__(self, huggingface_tokenizer_dir):
@@ -19,7 +22,7 @@ class HfBertTokenizer:
         if recover_unk:
             try:
                 tokens = self._recover_unk(text.lower(), tokens)
-            except Exception as e:
+            except Exception:
                 traceback.print_exc()
         return tokens, tokens_id
 
@@ -30,7 +33,7 @@ class HfBertTokenizer:
         new_tokens = []
         text_no_space = text.replace(" ", "")
 
-        if re.match(r"^[^a-zA-Z0-9']+$", text):
+        if _RE_PURE_CN.match(text):
             tmp_text = text_no_space
             if len(tmp_text) == len(tokens):
                 success = True
@@ -56,7 +59,7 @@ class HfBertTokenizer:
 
                 post_token = ""
                 if j < len(tokens):
-                    post_token = tokens[j].replace("##", "")
+                    post_token = _RE_BERT_PREFIX.sub("", tokens[j])
 
                 if post_token:
                     remaining = text_no_space[text_pos:]
@@ -66,7 +69,7 @@ class HfBertTokenizer:
                     else:
                         unk_chars = remaining[:unk_count]
                 else:
-                    unk_chars = text_no_space[text_pos:text_pos + unk_count]
+                    unk_chars = text_no_space[text_pos : text_pos + unk_count]
 
                 for k in range(unk_count):
                     if k < len(unk_chars):
@@ -77,7 +80,7 @@ class HfBertTokenizer:
                 i = j
             else:
                 new_tokens.append(token)
-                token_clean = token.replace("##", "")
+                token_clean = _RE_BERT_PREFIX.sub("", token)
                 text_pos += len(token_clean)
                 i += 1
 

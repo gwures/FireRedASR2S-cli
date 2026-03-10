@@ -65,5 +65,5 @@ def create_huggingface_bert_attention_mask(lengths):
     T = int(lengths.max())
     mask = lengths.new_ones((N, T))
     for i in range(N):
-        mask[i, lengths[i]:] = 0
+        mask[i, lengths[i] :] = 0
     return mask.float()

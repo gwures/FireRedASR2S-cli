@@ -55,7 +55,8 @@ class FireRedAed:
                 config.max_event_frame,
                 config.min_silence_frame,
                 config.merge_silence_frame,
-                config.extend_speech_frame)
+                config.extend_speech_frame,
+            )
         return cls(audio_feat, model, event2postprocessor, config)
 
     def __init__(self, audio_feat, model, event2postprocessor, config):
@@ -68,8 +69,7 @@ class FireRedAed:
         # Extract feat
         feat, dur = self.audio_feat.extract(audio)
         if self.config.use_gpu:
-            feat = feat.pin_memory()
-            feat = feat.cuda(non_blocking=True)
+            feat = feat.to(device="cuda", non_blocking=True)
 
         # Model inference
         if feat.size(0) <= self.config.chunk_max_frame:
@@ -77,7 +77,9 @@ class FireRedAed:
             assert probs.size(-1) == len(self.IDX2EVENT)
             probs = probs.cpu().squeeze(0)  # (T,3)
         else:
-            logger.debug(f"Too long input, split every {self.config.chunk_max_frame} frames")
+            logger.debug(
+                f"Too long input, split every {self.config.chunk_max_frame} frames"
+            )
             chunk_probs = []
             chunks = feat.split(self.config.chunk_max_frame, dim=0)
             for chunk in chunks:
@@ -98,13 +100,19 @@ class FireRedAed:
             starts_ends_s = postprocessor.decision_to_segment(decision, dur)
             event2starts_ends_s[event] = starts_ends_s
 
-            raw_ratio = sum(int(p>= threshold) for p in event_probs) / len(event_probs) if len(event_probs) else 0
+            raw_ratio = (
+                sum(int(p >= threshold) for p in event_probs) / len(event_probs)
+                if len(event_probs)
+                else 0
+            )
             event2raw_ratio[event] = round(raw_ratio, 3)
 
         # Format result
-        result = {"dur": round(dur, 3),
-                  "event2timestamps": event2starts_ends_s,
-                  "event2ratio": event2raw_ratio}
+        result = {
+            "dur": round(dur, 3),
+            "event2timestamps": event2starts_ends_s,
+            "event2ratio": event2raw_ratio,
+        }
         if isinstance(audio, str):
             result["wav_path"] = audio
         return result, probs

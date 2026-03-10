@@ -9,8 +9,10 @@ _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 try:
     from fireredasr2s.fireredvad.aed import FireRedAed, FireRedAedConfig
-    from fireredasr2s.fireredvad.stream_vad import (FireRedStreamVad,
-                                                    FireRedStreamVadConfig)
+    from fireredasr2s.fireredvad.stream_vad import (
+        FireRedStreamVad,
+        FireRedStreamVadConfig,
+    )
     from fireredasr2s.fireredvad.vad import FireRedVad, FireRedVadConfig
 except ImportError:
     if _CURRENT_DIR not in sys.path:
@@ -28,7 +30,9 @@ def non_stream_vad(wav_path, model_dir="pretrained_models/FireRedVAD/VAD", **kwa
     return result
 
 
-def stream_vad_full(wav_path, model_dir="pretrained_models/FireRedVAD/Stream-VAD", **kwargs):
+def stream_vad_full(
+    wav_path, model_dir="pretrained_models/FireRedVAD/Stream-VAD", **kwargs
+):
     """Quick Stream VAD inference"""
     config = FireRedStreamVadConfig(**kwargs)
     svad = FireRedStreamVad.from_pretrained(model_dir, config)
@@ -45,14 +49,14 @@ def non_stream_aed(wav_path, model_dir="pretrained_models/FireRedVAD/AED", **kwa
 
 
 __all__ = [
-    '__version__',
-    'FireRedVad',
-    'FireRedVadConfig',
-    'FireRedAed',
-    'FireRedAedConfig', 
-    'FireRedStreamVad',
-    'FireRedStreamVadConfig',
-    'non_stream_vad',
-    'stream_vad_full',
-    'non_stream_aed'
+    "__version__",
+    "FireRedVad",
+    "FireRedVadConfig",
+    "FireRedAed",
+    "FireRedAedConfig",
+    "FireRedStreamVad",
+    "FireRedStreamVadConfig",
+    "non_stream_vad",
+    "stream_vad_full",
+    "non_stream_aed",
 ]

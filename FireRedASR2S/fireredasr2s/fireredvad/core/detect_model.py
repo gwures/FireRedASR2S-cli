@@ -1,18 +1,21 @@
 # Copyright 2026 Xiaohongshu. (Author: Kaituo Xu, Kai Huang)
 
 import os
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import Tensor
 
 
 class DetectModel(nn.Module):
     @classmethod
     def from_pretrained(cls, model_dir):
         model_path = os.path.join(model_dir, "model.pth.tar")
-        package = torch.load(model_path,
-            map_location=lambda storage, loc: storage, weights_only=False)
+        package = torch.load(
+            model_path, map_location=lambda storage, loc: storage, weights_only=False
+        )
         model = cls(package["args"])
         model.load_state_dict(package["model_state_dict"], strict=True)
         model.eval()
@@ -20,9 +23,18 @@ class DetectModel(nn.Module):
 
     def __init__(self, args):
         super().__init__()
-        self.dfsmn = DFSMN(args.idim, args.R, args.M, args.H, args.P,
-                           args.N1, args.S1, args.N2, args.S2,
-                           args.dropout)
+        self.dfsmn = DFSMN(
+            args.idim,
+            args.R,
+            args.M,
+            args.H,
+            args.P,
+            args.N1,
+            args.S1,
+            args.N2,
+            args.S2,
+            args.dropout,
+        )
         self.out = torch.nn.Linear(args.H, args.odim)
 
     @torch.inference_mode()
@@ -51,16 +63,18 @@ class DFSMN(nn.Module):
         super().__init__()
         # Components
         # 1st FSMN block connecting input layer, without skip connection
-        self.fc1 = nn.Sequential(nn.Linear(D, H, bias=True),
-                                 nn.ReLU(),
-                                 nn.Dropout(dropout))
-        self.fc2 = nn.Sequential(nn.Linear(H, P, bias=True),
-                                 nn.ReLU(),
-                                 nn.Dropout(dropout))
+        self.fc1 = nn.Sequential(
+            nn.Linear(D, H, bias=True), nn.ReLU(), nn.Dropout(dropout)
+        )
+        self.fc2 = nn.Sequential(
+            nn.Linear(H, P, bias=True), nn.ReLU(), nn.Dropout(dropout)
+        )
         self.fsmn1 = FSMN(P, N1, S1, N2, S2)
         # N-1 DFSMN blocks
-        self.fsmns = nn.ModuleList([DFSMNBlock(H, P, N1, S1, N2, S2, dropout) for _ in range(R-1)])
-        # M DNN layers 
+        self.fsmns = nn.ModuleList(
+            [DFSMNBlock(H, P, N1, S1, N2, S2, dropout) for _ in range(R - 1)]
+        )
+        # M DNN layers
         dnn = [nn.Linear(P, H, bias=True), nn.ReLU(), nn.Dropout(dropout)]
         for l in range(M - 1):
             dnn += [nn.Linear(H, H, bias=True), nn.ReLU(), nn.Dropout(dropout)]
@@ -106,7 +120,6 @@ class DFSMN(nn.Module):
         return output, new_caches
 
 
-
 def get_mask_from_lengths(lengths):
     """Mask position is set to 1 for Tensor.masked_fill(mask, value)
     Args:
@@ -114,13 +127,11 @@ def get_mask_from_lengths(lengths):
     Return:
         mask: (N, T)
     """
-    N = lengths.size(0)
     T = torch.max(lengths).item()
     device = lengths.device
     indices = torch.arange(T, device=device)
     mask = lengths.unsqueeze(1) <= indices
     return mask.to(torch.bool)
-
 
 
 class DFSMNBlock(nn.Module):
@@ -143,9 +154,9 @@ class DFSMNBlock(nn.Module):
         self.H, self.P, self.N1, self.S1, self.N2, self.S2 = H, P, N1, S1, N2, S2
         # Components
         # step1. \hat{P}^{l-1} -> H^{l}, nonlinear affine transform
-        self.fc1 = nn.Sequential(nn.Linear(P, H, bias=True),
-                                 nn.ReLU(),
-                                 nn.Dropout(dropout))
+        self.fc1 = nn.Sequential(
+            nn.Linear(P, H, bias=True), nn.ReLU(), nn.Dropout(dropout)
+        )
         # Step2. H^{l} -> P^{l}, linear affine transform
         self.fc2 = nn.Linear(H, P, bias=False)
         # Step3. P^{l}-> \hat{P}^{l}, fsmn layer
@@ -189,16 +200,28 @@ class FSMN(nn.Module):
         self.N1, self.S1, self.N2, self.S2 = N1, S1, N2, S2
         # Components
         # P^{l}-> \hat{P}^{l}
-        self.lookback_padding = (N1-1)*S1
-        self.lookback_filter = nn.Conv1d(in_channels=P, out_channels=P,
-                                         kernel_size=N1, stride=1,
-                                         padding=self.lookback_padding, dilation=S1,
-                                         groups=P, bias=False)
+        self.lookback_padding = (N1 - 1) * S1
+        self.lookback_filter = nn.Conv1d(
+            in_channels=P,
+            out_channels=P,
+            kernel_size=N1,
+            stride=1,
+            padding=self.lookback_padding,
+            dilation=S1,
+            groups=P,
+            bias=False,
+        )
         if self.N2 > 0:
-            self.lookahead_filter = nn.Conv1d(in_channels=P, out_channels=P,
-                                              kernel_size=N2, stride=1,
-                                              padding=(N2-1)*S2, dilation=S2,
-                                              groups=P, bias=False)
+            self.lookahead_filter = nn.Conv1d(
+                in_channels=P,
+                out_channels=P,
+                kernel_size=N2,
+                stride=1,
+                padding=(N2 - 1) * S2,
+                dilation=S2,
+                groups=P,
+                bias=False,
+            )
         else:
             self.lookahead_filter = nn.Identity()
 
@@ -214,20 +237,20 @@ class FSMN(nn.Module):
         """
         T = inputs.size(1)
         if mask is not None:
-            mask = mask.unsqueeze(-1) # [N, T, 1]
+            mask = mask.unsqueeze(-1)  # [N, T, 1]
             inputs = inputs.masked_fill(mask, 0.0)
 
-        inputs = inputs.permute((0, 2, 1)).contiguous() # [N, T, P] -> [N, P, T]
+        inputs = inputs.permute((0, 2, 1)).contiguous()  # [N, T, P] -> [N, P, T]
         residual = inputs
-        
+
         if cache is not None:
             inputs = torch.cat((cache, inputs), dim=2)  # (N, P, C+T)
-        new_cache = inputs[:, :, -self.lookback_padding:]  # (N, P, Co)
+        new_cache = inputs[:, :, -self.lookback_padding :]  # (N, P, Co)
 
         # P^{l}-> \hat{P}^{l}, fsmn layer
         lookback = self.lookback_filter(inputs)
         if self.N1 > 1:
-            lookback = lookback[:, :, :-(self.N1-1)*self.S1]
+            lookback = lookback[:, :, : -(self.N1 - 1) * self.S1]
             if cache is not None:
                 start = cache.size(2)
                 lookback = lookback[:, :, start:]
@@ -237,8 +260,8 @@ class FSMN(nn.Module):
 
         if self.N2 > 0 and T > 1:
             lookahead = self.lookahead_filter(inputs)
-            memory += F.pad(lookahead[:, :, self.N2*self.S2:], (0, self.S2))
-        memory = memory.permute((0, 2, 1)).contiguous() # [N, P, T] -> [N, T, P]
+            memory += F.pad(lookahead[:, :, self.N2 * self.S2 :], (0, self.S2))
+        memory = memory.permute((0, 2, 1)).contiguous()  # [N, P, T] -> [N, T, P]
 
         if mask is not None:
             memory = memory.masked_fill(mask, 0.0)

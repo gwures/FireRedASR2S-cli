@@ -42,7 +42,7 @@ class TokenDict:
 
     def read_dict(self, dict_path):
         id2word, word2id = [], {}
-        with open(dict_path, encoding='utf8') as f:
+        with open(dict_path, encoding="utf8") as f:
             for i, line in enumerate(f):
                 tokens = line.strip().split()
                 if len(tokens) >= 2:
@@ -50,12 +50,16 @@ class TokenDict:
                 elif len(tokens) == 1:
                     word, index = tokens[0], i
                 else:
-                    logger.info(f"Find empty line or space '{line.strip()}' in {dict_path}:L{i}, set to ' '")
+                    logger.info(
+                        f"Find empty line or space '{line.strip()}' in {dict_path}:L{i}, set to ' '"
+                    )
                     word, index = " ", i
                 assert len(id2word) == index
                 assert len(word2id) == index
                 if word == "<space>":
-                    logger.info(f"NOTE: Find <space> in {dict_path}:L{i} and convert it to ' '")
+                    logger.info(
+                        f"NOTE: Find <space> in {dict_path}:L{i} and convert it to ' '"
+                    )
                     word = " "
                 word2id[word] = index
                 id2word.append(word)

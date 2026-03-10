@@ -11,8 +11,7 @@ import torch
 from .core.audio_feat import AudioFeat
 from .core.constants import FRAME_LENGTH_SAMPLE, FRAME_PER_SECONDS
 from .core.detect_model import DetectModel
-from .core.stream_vad_postprocessor import (StreamVadFrameResult,
-                                            StreamVadPostprocessor)
+from .core.stream_vad_postprocessor import StreamVadFrameResult, StreamVadPostprocessor
 
 logger = logging.getLogger(__name__)
 
@@ -22,17 +21,17 @@ class FireRedStreamVadConfig:
     use_gpu: bool = False
     smooth_window_size: int = 5
     speech_threshold: float = 0.5
-    pad_start_frame : int = 5
+    pad_start_frame: int = 5
     min_speech_frame: int = 8
     max_speech_frame: int = 2000  # 20s
     min_silence_frame: int = 20
     chunk_max_frame: int = 30000  # 300s
+
     def __post_init__(self):
         if self.speech_threshold < 0 or self.speech_threshold > 1:
             raise ValueError("speech_threshold must be in [0, 1]")
         if self.min_speech_frame <= 0:
             raise ValueError("min_speech_frame must be positive")
-
 
 
 class FireRedStreamVad:
@@ -56,7 +55,8 @@ class FireRedStreamVad:
             config.pad_start_frame,
             config.min_speech_frame,
             config.max_speech_frame,
-            config.min_silence_frame)
+            config.min_silence_frame,
+        )
         return cls(feat_extractor, vad_model, postprocessor, config)
 
     def __init__(self, audio_feat, vad_model, postprocessor, config):
@@ -73,16 +73,18 @@ class FireRedStreamVad:
 
     def detect_frame(self, audio_frame: np.ndarray) -> StreamVadFrameResult:
         if len(audio_frame) != FRAME_LENGTH_SAMPLE:
-            raise ValueError(f"Expected {FRAME_LENGTH_SAMPLE} samples, got {len(audio_frame)}")
+            raise ValueError(
+                f"Expected {FRAME_LENGTH_SAMPLE} samples, got {len(audio_frame)}"
+            )
 
         feat, dur = self.audio_feat.extract(audio_frame)
         if self.config.use_gpu:
-            feat = feat.pin_memory()
-            feat = feat.cuda(non_blocking=True)
+            feat = feat.to(device="cuda", non_blocking=True)
 
         with torch.inference_mode():
             prob, self.model_caches = self.vad_model.forward(
-                feat.unsqueeze(0), caches=self.model_caches)
+                feat.unsqueeze(0), caches=self.model_caches
+            )
         raw_prob = prob.cpu().squeeze().tolist()
 
         frame_result = self.postprocessor.process_one_frame(raw_prob)
@@ -91,12 +93,12 @@ class FireRedStreamVad:
     def detect_chunk(self, audio_chunk: np.ndarray) -> List[StreamVadFrameResult]:
         feats, dur = self.audio_feat.extract(audio_chunk)
         if self.config.use_gpu:
-            feats = feats.pin_memory()
-            feats = feats.cuda(non_blocking=True)
+            feats = feats.to(device="cuda", non_blocking=True)
 
         with torch.inference_mode():
             probs, self.model_caches = self.vad_model.forward(
-                feats.unsqueeze(0), caches=self.model_caches)
+                feats.unsqueeze(0), caches=self.model_caches
+            )
         raw_probs = probs.cpu().squeeze().tolist()
         if isinstance(raw_probs, float):
             raw_probs = [raw_probs]
@@ -107,18 +109,21 @@ class FireRedStreamVad:
             chunk_results.append(stream_vad_frame_result)
         return chunk_results
 
-    def detect_full(self, audio: Union[str, np.ndarray]) -> Tuple[List[StreamVadFrameResult], dict]:
+    def detect_full(
+        self, audio: Union[str, np.ndarray]
+    ) -> Tuple[List[StreamVadFrameResult], dict]:
         self.reset()
         feats, dur = self.audio_feat.extract(audio)
         if self.config.use_gpu:
-            feats = feats.pin_memory()
-            feats = feats.cuda(non_blocking=True)
+            feats = feats.to(device="cuda", non_blocking=True)
 
         with torch.inference_mode():
             if feats.size(0) <= self.config.chunk_max_frame:
                 probs, _ = self.vad_model.forward(feats.unsqueeze(0))
             else:
-                logger.debug(f"Too long input, split every {self.config.chunk_max_frame} frames")
+                logger.debug(
+                    f"Too long input, split every {self.config.chunk_max_frame} frames"
+                )
                 chunk_probs = []
                 chunks = feats.split(self.config.chunk_max_frame, dim=0)
                 for chunk in chunks:
@@ -138,14 +143,13 @@ class FireRedStreamVad:
 
         # Format result
         timestamps = self.results_to_timestamps(frame_results)
-        result = {"dur": round(dur, 3),
-                  "timestamps": timestamps}
+        result = {"dur": round(dur, 3), "timestamps": timestamps}
         if isinstance(audio, str):
             result["wav_path"] = audio
         return frame_results, result
 
     def set_mode(self, mode: int = 0):
-        if mode == 0:    # VERY PERMISSIVE
+        if mode == 0:  # VERY PERMISSIVE
             self.config.speech_threshold = 0.3
             self.config.min_speech_frame = 8
             self.config.min_silence_frame = 20
@@ -173,7 +177,8 @@ class FireRedStreamVad:
         start, end = -1, -1
         for r in results:
             if r.is_speech_start:
-                if start != -1: logger.warning("start should be -1")
+                if start != -1:
+                    logger.warning("start should be -1")
                 start = max(0, r.speech_start_frame - 1)
                 end = -1
             elif r.is_speech_end:
@@ -188,5 +193,5 @@ class FireRedStreamVad:
         # Convert to seconds
         timestamps = []
         for s, e in frame_timestamps:
-            timestamps.append((s/FRAME_PER_SECONDS, e/FRAME_PER_SECONDS))
+            timestamps.append((s / FRAME_PER_SECONDS, e / FRAME_PER_SECONDS))
         return timestamps

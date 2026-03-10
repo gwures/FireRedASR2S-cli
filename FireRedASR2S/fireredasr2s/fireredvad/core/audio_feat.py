@@ -3,25 +3,27 @@
 import math
 import os
 
-import kaldi_native_fbank as knf
 import kaldiio
 import numpy as np
 import soundfile as sf
 import torch
+import torchaudio.compliance.kaldi as kaldi
 
 
 class AudioFeat:
     def __init__(self, kaldi_cmvn_file):
         self.cmvn = CMVN(kaldi_cmvn_file) if kaldi_cmvn_file != "" else None
-        self.fbank = KaldifeatFbank(num_mel_bins=80, frame_length=25,
-            frame_shift=10, dither=0)
+        self.fbank = KaldifeatFbank(
+            num_mel_bins=80, frame_length=25, frame_shift=10, dither=0
+        )
 
     def reset(self):
         pass
 
-    def extract(self, audio):
+    def extract(self, audio, return_raw_fbank=False):
         if isinstance(audio, str):
             wav_np, sample_rate = sf.read(audio, dtype="int16")
+            wav_np = wav_np.astype(np.float32)
         elif isinstance(audio, (list, tuple)):
             sample_rate, wav_np = audio
         else:
@@ -29,18 +31,22 @@ class AudioFeat:
             sample_rate = 16000
 
         dur = wav_np.shape[0] / sample_rate
-        fbank = self.fbank((sample_rate, wav_np))
+        raw_fbank = self.fbank((sample_rate, wav_np))
         if self.cmvn is not None:
-            fbank = self.cmvn(fbank)
-        feat = torch.from_numpy(fbank)
-        return feat, dur
+            feat = self.cmvn(raw_fbank)
+        else:
+            feat = raw_fbank
 
+        if return_raw_fbank:
+            return feat, dur, raw_fbank
+        return feat, dur
 
 
 class CMVN:
     def __init__(self, kaldi_cmvn_file):
-        self.dim, self.means, self.inverse_std_variances = \
-            self.read_kaldi_cmvn(kaldi_cmvn_file)
+        self.dim, self.means, self.inverse_std_variances = self.read_kaldi_cmvn(
+            kaldi_cmvn_file
+        )
 
     def __call__(self, x, is_train=False):
         assert x.shape[-1] == self.dim, "CMVN dim mismatch"
@@ -66,40 +72,38 @@ class CMVN:
                 variance = floor
             istd = 1.0 / math.sqrt(variance)
             inverse_std_variances.append(istd)
-        return dim, np.array(means, dtype=np.float32), np.array(inverse_std_variances, dtype=np.float32)
-
+        return (
+            dim,
+            torch.tensor(means, dtype=torch.float32),
+            torch.tensor(inverse_std_variances, dtype=torch.float32),
+        )
 
 
 class KaldifeatFbank:
-    def __init__(self, num_mel_bins=80, frame_length=25, frame_shift=10,
-                 dither=0):
+    def __init__(self, num_mel_bins=80, frame_length=25, frame_shift=10, dither=0):
+        self.num_mel_bins = num_mel_bins
+        self.frame_length = frame_length
+        self.frame_shift = frame_shift
         self.dither = dither
-        opts = knf.FbankOptions()
-        opts.frame_opts.samp_freq = 16000
-        opts.frame_opts.frame_length_ms = 25
-        opts.frame_opts.frame_shift_ms = 10
-        opts.frame_opts.dither = dither
-        opts.frame_opts.snip_edges = True
-        opts.mel_opts.num_bins = num_mel_bins
-        opts.mel_opts.debug_mel = False
-        self.opts = opts
+        self.snip_edges = True
 
     def __call__(self, wav, is_train=False):
         if isinstance(wav, str):
             wav_np, sample_rate = sf.read(wav, dtype="int16")
+            wav_np = wav_np.astype(np.float32)
         elif isinstance(wav, (tuple, list)) and len(wav) == 2:
             sample_rate, wav_np = wav
         assert len(wav_np.shape) == 1
 
         dither = self.dither if is_train else 0.0
-        self.opts.frame_opts.dither = dither
-        fbank = knf.OnlineFbank(self.opts)
-
-        fbank.accept_waveform(sample_rate, wav_np)
-        num_frames = fbank.num_frames_ready
-        if num_frames == 0:
-            return np.zeros((0, self.opts.mel_opts.num_bins), dtype=np.float32)
-        feat = np.empty((num_frames, self.opts.mel_opts.num_bins), dtype=np.float32)
-        for i in range(num_frames):
-            feat[i] = fbank.get_frame(i)
+        wav_tensor = torch.from_numpy(wav_np).unsqueeze(0)
+        feat = kaldi.fbank(
+            wav_tensor,
+            num_mel_bins=self.num_mel_bins,
+            frame_length=self.frame_length,
+            frame_shift=self.frame_shift,
+            dither=dither,
+            snip_edges=self.snip_edges,
+            sample_frequency=16000,
+        )
         return feat

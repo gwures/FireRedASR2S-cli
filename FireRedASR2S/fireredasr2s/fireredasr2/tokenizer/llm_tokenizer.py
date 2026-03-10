@@ -9,9 +9,9 @@ from transformers.trainer_pt_utils import LabelSmoother
 DEFAULT_SPEECH_TOKEN = "<speech>"
 IGNORE_TOKEN_ID = LabelSmoother.ignore_index
 
-_PUNC_PATTERN = re.compile(r"[，。？！,\.!?《》（）\·""、\\/]")
+_PUNC_PATTERN = re.compile(r"[，。？！,\.!?《》（）\·" "、\\/]")
 _SPACE_PATTERN = re.compile(r"\s+")
-_CHINESE_PATTERN = re.compile(r'([\u3400-\u4dbf\u4e00-\u9fff])')
+_CHINESE_PATTERN = re.compile(r"([\u3400-\u4dbf\u4e00-\u9fff])")
 
 
 class LlmTokenizerWrapper:
@@ -94,7 +94,7 @@ class LlmTokenizerWrapper:
         if mask_prompt:
             mask_indices = torch.where(
                 input_ids == tokenizer.convert_tokens_to_ids("assistant")
-                )
+            )
             for i in range(mask_indices[0].size(0)):
                 row = mask_indices[0][i]
                 col = mask_indices[1][i]
